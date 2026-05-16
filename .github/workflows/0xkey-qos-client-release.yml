@@ -1,0 +1,380 @@
+name: 0xkey qos_client release
+
+# Builds the operator-facing `qos_client` binary for the 0xkey fork and
+# publishes it to a GitHub Release with SLSA build provenance.
+#
+# Two build legs:
+#   * linux-amd64  — stagex buildx (reproducible, inherits upstream pipeline).
+#   * darwin-arm64 — native cargo build on GitHub Actions macos-14 runner.
+#
+# This workflow is independent of the upstream `stagex-release.yml`, which
+# targets `qos_core-v*` tags and pushes container images to GHCR.
+#
+# Note: action refs below intentionally use floating tags (e.g. @v4) for
+# initial review readability. Pin to immutable SHAs (à la
+# stagex-release.yml) before merging to `0xkey`.
+#
+# Runner selection:
+#   * `ubicloud-standard-16` matches upstream `stagex-release.yml`. stagex
+#     builds want ~16 cores to complete in a reasonable time. If the
+#     `0xkey-io` org has not enrolled in Ubicloud yet, swap the linux job
+#     `runs-on:` to `ubuntu-latest-16-cores` (GitHub-hosted) — same shape,
+#     ~2x cost, no other changes needed.
+
+on:
+  push:
+    tags:
+      - '0xkey-qos_client-v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to build and publish (e.g. 0xkey-qos_client-v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux-amd64:
+    name: build qos_client (linux-amd64)
+    runs-on: ubicloud-standard-16
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Resolve release tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -eu
+          if [ -n "${INPUT_TAG:-}" ]; then
+            tag="$INPUT_TAG"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "release_tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout sources
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          ref: ${{ steps.tag.outputs.release_tag }}
+
+      - name: Verify checkout matches requested release tag
+        env:
+          TAG: ${{ steps.tag.outputs.release_tag }}
+        run: |
+          set -eu
+          expected="$(git rev-parse --verify "${TAG}^{commit}")"
+          actual="$(git rev-parse HEAD)"
+          if [ "$expected" != "$actual" ]; then
+            echo "Expected tag $TAG to resolve to $expected, but HEAD is $actual" >&2
+            exit 1
+          fi
+
+      - name: Setup Docker
+        uses: ./.github/actions/docker-setup
+
+      - name: Build qos_client OCI layout (reproducible buildx)
+        shell: 'script -q -e -c "bash {0}"'
+        run: make out/qos_client/index.json
+
+      - name: Extract qos_client binary from OCI layout
+        run: |
+          set -eux
+          (cd out/qos_client && tar -cf - . | docker load)
+          cid=$(docker create qos-local/qos_client:latest)
+          docker cp "${cid}:/qos_client" qos_client.linux-amd64
+          docker rm "${cid}"
+          chmod +x qos_client.linux-amd64
+          file qos_client.linux-amd64
+
+      - name: Compute SHA256
+        run: |
+          set -eu
+          sha256sum qos_client.linux-amd64 | awk '{print $1}' > qos_client.linux-amd64.sha256
+          echo "linux-amd64 sha256: $(cat qos_client.linux-amd64.sha256)"
+
+      - name: Capture build metadata
+        run: |
+          set -eu
+          mkdir -p build-meta
+          revision="$(git rev-parse HEAD)"
+          size="$(stat -c '%s' qos_client.linux-amd64)"
+          sha="$(cat qos_client.linux-amd64.sha256)"
+          cat > build-meta/linux-amd64.json <<EOF
+          {
+            "platform": "linux-amd64",
+            "build_method": "stagex-buildx-reproducible",
+            "qos_revision": "${revision}",
+            "size": ${size},
+            "sha256": "${sha}"
+          }
+          EOF
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qos_client-linux-amd64
+          path: |
+            qos_client.linux-amd64
+            qos_client.linux-amd64.sha256
+            build-meta/linux-amd64.json
+          if-no-files-found: error
+          retention-days: 7
+
+  build-darwin-arm64:
+    name: build qos_client (darwin-arm64)
+    runs-on: macos-14
+    permissions:
+      contents: read
+    steps:
+      - name: Resolve release tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -eu
+          if [ -n "${INPUT_TAG:-}" ]; then
+            tag="$INPUT_TAG"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "release_tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout sources
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          ref: ${{ steps.tag.outputs.release_tag }}
+
+      - name: Verify checkout matches requested release tag
+        env:
+          TAG: ${{ steps.tag.outputs.release_tag }}
+        run: |
+          set -eu
+          expected="$(git rev-parse --verify "${TAG}^{commit}")"
+          actual="$(git rev-parse HEAD)"
+          if [ "$expected" != "$actual" ]; then
+            echo "Expected tag $TAG to resolve to $expected, but HEAD is $actual" >&2
+            exit 1
+          fi
+
+      - name: Setup Rust toolchain (pinned by rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Show toolchain
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Build qos_client (aarch64-apple-darwin, smartcard)
+        env:
+          SOURCE_DATE_EPOCH: "1"
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+          CARGO_TERM_COLOR: never
+          # Strip debuginfo + symbols at link time for a smaller, deterministic
+          # release binary (matches `strip = "symbols"` defaults in many rust
+          # release profiles; doesn't affect smartcard FFI linkage).
+          CARGO_PROFILE_RELEASE_STRIP: symbols
+        run: |
+          set -eux
+          cargo build --release --locked --features smartcard \
+            --target aarch64-apple-darwin -p qos_client
+          cp target/aarch64-apple-darwin/release/qos_client qos_client.darwin-arm64
+          chmod +x qos_client.darwin-arm64
+          file qos_client.darwin-arm64
+
+      - name: Compute SHA256
+        run: |
+          set -eu
+          shasum -a 256 qos_client.darwin-arm64 | awk '{print $1}' > qos_client.darwin-arm64.sha256
+          echo "darwin-arm64 sha256: $(cat qos_client.darwin-arm64.sha256)"
+
+      - name: Capture build metadata
+        run: |
+          set -eu
+          mkdir -p build-meta
+          revision="$(git rev-parse HEAD)"
+          size="$(stat -f '%z' qos_client.darwin-arm64)"
+          sha="$(cat qos_client.darwin-arm64.sha256)"
+          rust_version="$(rustc --version)"
+          cat > build-meta/darwin-arm64.json <<EOF
+          {
+            "platform": "darwin-arm64",
+            "build_method": "github-actions-macos-14-native-cargo",
+            "qos_revision": "${revision}",
+            "rust_toolchain": "${rust_version}",
+            "macosx_deployment_target": "${MACOSX_DEPLOYMENT_TARGET}",
+            "size": ${size},
+            "sha256": "${sha}"
+          }
+          EOF
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qos_client-darwin-arm64
+          path: |
+            qos_client.darwin-arm64
+            qos_client.darwin-arm64.sha256
+            build-meta/darwin-arm64.json
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-release:
+    name: publish GitHub release
+    runs-on: ubuntu-latest
+    needs: [build-linux-amd64, build-darwin-arm64]
+    permissions:
+      contents: write       # gh release create / upload
+      attestations: write   # actions/attest-build-provenance
+      id-token: write       # OIDC for sigstore
+    steps:
+      - name: Resolve release tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -eu
+          if [ -n "${INPUT_TAG:-}" ]; then
+            tag="$INPUT_TAG"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "release_tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout sources (for git metadata + release notes)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          ref: ${{ steps.tag.outputs.release_tag }}
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Stage release files and build MANIFEST.json
+        env:
+          TAG: ${{ steps.tag.outputs.release_tag }}
+        run: |
+          set -eux
+          mkdir -p release
+          cp artifacts/qos_client-linux-amd64/qos_client.linux-amd64        release/
+          cp artifacts/qos_client-linux-amd64/qos_client.linux-amd64.sha256 release/
+          cp artifacts/qos_client-darwin-arm64/qos_client.darwin-arm64        release/
+          cp artifacts/qos_client-darwin-arm64/qos_client.darwin-arm64.sha256 release/
+
+          linux_meta="artifacts/qos_client-linux-amd64/build-meta/linux-amd64.json"
+          darwin_meta="artifacts/qos_client-darwin-arm64/build-meta/darwin-arm64.json"
+
+          qos_revision="$(git rev-parse HEAD)"
+          built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          workflow_run_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          jq -n \
+            --arg tag "$TAG" \
+            --arg qos_revision "$qos_revision" \
+            --arg built_at "$built_at" \
+            --arg workflow_run_url "$workflow_run_url" \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --slurpfile linux "$linux_meta" \
+            --slurpfile darwin "$darwin_meta" \
+            '{
+              release_tag: $tag,
+              repo: $repo,
+              qos_revision: $qos_revision,
+              built_at: $built_at,
+              workflow_run_url: $workflow_run_url,
+              platforms: {
+                "linux-amd64": $linux[0],
+                "darwin-arm64": $darwin[0]
+              }
+            }' > release/MANIFEST.json
+
+          echo "MANIFEST.json:"
+          cat release/MANIFEST.json
+
+      - name: Generate SLSA build provenance attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            release/qos_client.linux-amd64
+            release/qos_client.darwin-arm64
+
+      - name: Render release notes
+        env:
+          TAG: ${{ steps.tag.outputs.release_tag }}
+        run: |
+          set -eu
+          revision="$(git rev-parse HEAD)"
+          linux_sha="$(cat release/qos_client.linux-amd64.sha256)"
+          darwin_sha="$(cat release/qos_client.darwin-arm64.sha256)"
+          cat > release-notes.md <<EOF
+          ## qos_client release ${TAG}
+
+          Built from commit \`${revision}\` on the \`0xkey\` fork branch.
+
+          ### Artifacts
+
+          | Platform | Binary | SHA256 |
+          |----------|--------|--------|
+          | linux-amd64  | \`qos_client.linux-amd64\`  | \`${linux_sha}\`  |
+          | darwin-arm64 | \`qos_client.darwin-arm64\` | \`${darwin_sha}\` |
+
+          See \`MANIFEST.json\` for machine-readable build metadata.
+
+          ### Reproducibility
+
+          - **linux-amd64**: \`make out/qos_client/index.json\` via stagex buildx with
+            \`SOURCE_DATE_EPOCH=1\` and pinned stagex base-image digests. Bit-for-bit
+            reproducible by re-running the same Make target on the same git tag in a
+            comparable Docker environment.
+          - **darwin-arm64**: native \`cargo build --release --locked --features smartcard
+            --target aarch64-apple-darwin\` on GitHub Actions \`macos-14\` runner.
+            Reproducible at the toolchain level (same runner image + \`rust-toolchain.toml\`
+            + same git tag => same binary). Not byte-for-byte reproducible across runner
+            image upgrades; verify via published \`.sha256\` and SLSA provenance.
+
+          ### Verification
+
+          \`\`\`bash
+          # Download artifacts
+          gh release download "${TAG}" -R 0xkey-io/qos -p 'qos_client.*' -p 'MANIFEST.json'
+
+          # Verify SHA256
+          shasum -a 256 -c <(printf '%s  qos_client.linux-amd64\n'  "${linux_sha}")
+          shasum -a 256 -c <(printf '%s  qos_client.darwin-arm64\n' "${darwin_sha}")
+
+          # Verify SLSA build provenance attestation (gh CLI >= 2.49)
+          gh attestation verify qos_client.linux-amd64  -R 0xkey-io/qos
+          gh attestation verify qos_client.darwin-arm64 -R 0xkey-io/qos
+          \`\`\`
+          EOF
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.release_tag }}
+        run: |
+          set -eux
+          assets=(
+            release/qos_client.linux-amd64
+            release/qos_client.linux-amd64.sha256
+            release/qos_client.darwin-arm64
+            release/qos_client.darwin-arm64.sha256
+            release/MANIFEST.json
+          )
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${assets[@]}" --clobber
+            gh release edit   "$TAG" --notes-file release-notes.md
+          else
+            gh release create "$TAG" "${assets[@]}" \
+              --title "qos_client ${TAG}" \
+              --notes-file release-notes.md
+          fi
