@@ -15,11 +15,13 @@ name: 0xkey qos_client release
 # stagex-release.yml) before merging to `0xkey`.
 #
 # Runner selection:
-#   * `ubicloud-standard-16` matches upstream `stagex-release.yml`. stagex
-#     builds want ~16 cores to complete in a reasonable time. If the
-#     `0xkey-io` org has not enrolled in Ubicloud yet, swap the linux job
-#     `runs-on:` to `ubuntu-latest-16-cores` (GitHub-hosted) — same shape,
-#     ~2x cost, no other changes needed.
+#   * The linux job runs on `ubuntu-latest` (GitHub-hosted, free for public
+#     repos). stagex builds are heavier than usual cargo workloads; we
+#     only build the qos_client image (not the full enclave/host/bridge
+#     matrix), so 4 cores is acceptable. If the build time becomes a
+#     problem, swap to `ubuntu-latest-16-cores` (paid larger runner) or
+#     `ubicloud-standard-16` once the `0xkey-io` org is enrolled in
+#     Ubicloud (matches upstream `stagex-release.yml`).
 
 on:
   push:
@@ -38,7 +40,7 @@ permissions:
 jobs:
   build-linux-amd64:
     name: build qos_client (linux-amd64)
-    runs-on: ubicloud-standard-16
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: read
@@ -130,6 +132,10 @@ jobs:
     runs-on: macos-14
     permissions:
       contents: read
+    env:
+      # Hoisted to job level so the "Capture build metadata" step (run under
+      # `set -u`) can read it without the previous step's env scope.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - name: Resolve release tag
         id: tag
@@ -175,7 +181,6 @@ jobs:
       - name: Build qos_client (aarch64-apple-darwin, smartcard)
         env:
           SOURCE_DATE_EPOCH: "1"
-          MACOSX_DEPLOYMENT_TARGET: "11.0"
           CARGO_TERM_COLOR: never
           # Strip debuginfo + symbols at link time for a smaller, deterministic
           # release binary (matches `strip = "symbols"` defaults in many rust
