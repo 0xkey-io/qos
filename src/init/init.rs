@@ -61,7 +61,7 @@ fn boot() {
 #[tokio::main]
 async fn main() {
 	boot();
-	dmesg("QuorumOS Booted".to_string());
+	dmesg("QuorumOS Booted (pcr-test-2026-05-27)".to_string());
 
 	let cid = get_local_cid().unwrap();
 	dmesg(format!("CID is {cid}"));
