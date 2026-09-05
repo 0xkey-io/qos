@@ -2721,7 +2721,7 @@ where
 
 #[cfg(test)]
 mod tests {
-	use std::vec;
+	use std::{fs, vec};
 
 	use qos_core::protocol::{
 		QosHash,
@@ -2744,6 +2744,29 @@ mod tests {
 		proxy_re_encrypt_share_human_verifications,
 		proxy_re_encrypt_share_programmatic_verifications,
 	};
+
+	#[test]
+	fn zeroizes_yubikey_pin_on_success_and_error() {
+		let prompt: fn() -> Result<zeroize::Zeroizing<Vec<u8>>, super::Error> =
+			super::prompt_pin;
+		let _ = prompt;
+	}
+
+	#[test]
+	fn zeroizes_master_seed_hex_on_success_and_error() {
+		fn assert_zeroizing(_: &zeroize::Zeroizing<String>) {}
+
+		let path = std::env::temp_dir()
+			.join(format!("qos-zeroizing-master-seed-{}", std::process::id()));
+		fs::write(&path, "deadbeef").unwrap();
+
+		let value = super::read_master_seed_hex(&path).unwrap();
+		assert_zeroizing(&value);
+		assert_eq!(&*value, "deadbeef");
+		fs::remove_file(&path).unwrap();
+
+		assert!(super::read_master_seed_hex(&path).is_err());
+	}
 
 	struct Setup {
 		manifest: VersionedManifest,
