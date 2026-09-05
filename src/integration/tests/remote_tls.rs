@@ -18,6 +18,7 @@ const REMOTE_TLS_TEST_ENCLAVE_SOCKET: &str =
 const POOL_SIZE: &str = "1";
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires external network"]
 async fn fetch_async_remote_tls_content() {
 	let _net_proxy: ChildWrapper = Command::new(QOS_NET_PATH)
 		.arg("--usock")

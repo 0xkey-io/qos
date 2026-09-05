@@ -172,6 +172,7 @@ mod test {
 	use crate::proxy_connection::ProxyConnection;
 
 	#[tokio::test]
+	#[ignore = "requires external network"]
 	async fn can_fetch_and_parse_chunked_json_over_tls_with_local_stream() {
 		let host = "www.googleapis.com";
 		let path = "/oauth2/v3/certs";

@@ -1,6 +1,6 @@
 use std::{
 	fs::{self, File},
-	io::{self, BufRead, BufReader, Write},
+	io::{self, BufRead, Read, Write},
 	mem,
 	net::IpAddr,
 	path::{Path, PathBuf},
@@ -403,19 +403,26 @@ pub(crate) fn provision_yubikey<P: AsRef<Path>>(
 }
 
 pub(crate) fn pin_from_path<P: AsRef<Path>>(path: P) -> Zeroizing<Vec<u8>> {
-	let file = File::open(path).expect("Failed to open current pin path");
-	let line = BufReader::new(file)
+	let contents = read_secret_utf8(path.as_ref())
+		.expect("Failed to read current pin path as UTF-8");
+	let line = contents
 		.lines()
 		.next()
-		.expect("First line missing from current pin file")
-		.expect("Error reading first line");
-	Zeroizing::new(line.into_bytes())
+		.expect("First line missing from current pin file");
+	Zeroizing::new(line.as_bytes().to_vec())
 }
 
 #[cfg(feature = "smartcard")]
 fn prompt_pin() -> Result<Zeroizing<Vec<u8>>, Error> {
-	let pin = rpassword::prompt_password(ENTER_PIN_PROMPT)
-		.map_err(Error::PinEntryError)?;
+	prompt_pin_with(|prompt| rpassword::prompt_password(prompt))
+}
+
+#[cfg(feature = "smartcard")]
+fn prompt_pin_with<F>(prompt: F) -> Result<Zeroizing<Vec<u8>>, Error>
+where
+	F: FnOnce(&str) -> io::Result<String>,
+{
+	let pin = prompt(ENTER_PIN_PROMPT).map_err(Error::PinEntryError)?;
 	Ok(Zeroizing::new(pin.into_bytes()))
 }
 
@@ -525,9 +532,11 @@ pub(crate) fn boot_genesis<P: AsRef<Path>>(
 			} => (document, genesis_output),
 			r => panic!("Unexpected response: {r:?}"),
 		};
-	if genesis_output.set != genesis_set || genesis_output.dr_key != dr_key {
-		return Err(Error::GenesisOutputDoesNotMatchRequest);
-	}
+	validate_genesis_output_matches_request(
+		&genesis_output,
+		&genesis_set,
+		dr_key.as_deref(),
+	)?;
 	let quorum_key =
 		P256Public::from_bytes(&genesis_output.quorum_key).unwrap();
 	let attestation_doc =
@@ -619,6 +628,19 @@ pub(crate) fn boot_genesis<P: AsRef<Path>>(
 	Ok(())
 }
 
+fn validate_genesis_output_matches_request(
+	genesis_output: &GenesisOutput,
+	requested_set: &GenesisSet,
+	requested_dr_key: Option<&[u8]>,
+) -> Result<(), Error> {
+	if genesis_output.set != *requested_set
+		|| genesis_output.dr_key.as_deref() != requested_dr_key
+	{
+		return Err(Error::GenesisOutputDoesNotMatchRequest);
+	}
+	Ok(())
+}
+
 pub(crate) fn verify_genesis<P: AsRef<Path>>(
 	namespace_dir: P,
 	master_seed_path: P,
@@ -634,14 +656,13 @@ pub(crate) fn verify_genesis<P: AsRef<Path>>(
 	);
 
 	let master_seed_path = master_seed_path.as_ref();
-	let master_seed_hex = Zeroizing::new(
-		fs::read_to_string(master_seed_path).unwrap_or_else(|e| {
+	let master_seed_hex = read_master_seed_hex(master_seed_path)
+		.unwrap_or_else(|e| {
 			panic!(
 				"verify_genesis: Could not read master seed from {}: {e}",
 				master_seed_path.display()
 			)
-		}),
-	);
+		});
 	let pair = P256Pair::from_hex_file(master_seed_path).unwrap_or_else(|e| {
 		panic!(
 			"verify_genesis: Could not parse master seed from {}: {e:?}",
@@ -686,6 +707,19 @@ pub(crate) fn verify_genesis<P: AsRef<Path>>(
 	println!("verify-genesis successful");
 
 	Ok(())
+}
+
+fn read_master_seed_hex(path: &Path) -> io::Result<Zeroizing<String>> {
+	read_secret_utf8(path)
+}
+
+fn read_secret_utf8(path: &Path) -> io::Result<Zeroizing<String>> {
+	let mut file = File::open(path)?;
+	let mut bytes = Zeroizing::new(Vec::new());
+	file.read_to_end(&mut bytes)?;
+	let value = std::str::from_utf8(&bytes)
+		.map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+	Ok(Zeroizing::new(value.to_owned()))
 }
 
 pub(crate) struct AfterGenesisArgs<P: AsRef<Path>> {
@@ -2715,6 +2749,7 @@ where
 #[cfg(test)]
 mod tests {
 	use std::{fs, vec};
+	use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 	use qos_core::protocol::{
 		QosHash,
@@ -2726,6 +2761,7 @@ mod tests {
 			PivotConfigV2, PivotEnv, QuorumMember, RestartPolicy, ShareSet,
 			VersionedManifest, VersionedManifestEnvelope,
 		},
+		services::genesis::{GenesisOutput, GenesisSet},
 	};
 	use qos_nsm::nitro::{AWS_ROOT_CERT_PEM, cert_from_pem};
 	use qos_p256::{P256Pair, P256Public};
@@ -2740,25 +2776,99 @@ mod tests {
 
 	#[test]
 	fn zeroizes_yubikey_pin_on_success_and_error() {
-		let prompt: fn() -> Result<zeroize::Zeroizing<Vec<u8>>, super::Error> =
-			super::prompt_pin;
-		let _ = prompt;
+		fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+		assert_zeroize_on_drop::<Zeroizing<Vec<u8>>>();
+		assert_zeroize_on_drop::<Zeroizing<String>>();
+
+		let path = std::env::temp_dir()
+			.join(format!("qos-zeroizing-pin-{}", std::process::id()));
+		fs::write(&path, "123456\nignored").unwrap();
+		{
+			let pin = super::pin_from_path(&path);
+			assert_eq!(&*pin, b"123456");
+		} // Zeroizing's type contract wipes the PIN here.
+
+		fs::write(&path, b"123456\xffsecret").unwrap();
+		let error = super::read_secret_utf8(&path).unwrap_err();
+		assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+		assert!(!error.to_string().contains("123456"));
+		assert!(!error.to_string().contains("secret"));
+		fs::remove_file(&path).unwrap();
 	}
 
 	#[test]
 	fn zeroizes_master_seed_hex_on_success_and_error() {
-		fn assert_zeroizing(_: &zeroize::Zeroizing<String>) {}
+		fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+		assert_zeroize_on_drop::<Zeroizing<String>>();
 
 		let path = std::env::temp_dir()
 			.join(format!("qos-zeroizing-master-seed-{}", std::process::id()));
 		fs::write(&path, "deadbeef").unwrap();
 
-		let value = super::read_master_seed_hex(&path).unwrap();
-		assert_zeroizing(&value);
-		assert_eq!(&*value, "deadbeef");
+		{
+			let value = super::read_master_seed_hex(&path).unwrap();
+			assert_eq!(&*value, "deadbeef");
+		} // Zeroizing's type contract wipes the seed here.
+		fs::write(&path, b"deadbeef\xffsecret").unwrap();
+		let error = super::read_master_seed_hex(&path).unwrap_err();
+		assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+		assert!(!error.to_string().contains("deadbeef"));
+		assert!(!error.to_string().contains("secret"));
 		fs::remove_file(&path).unwrap();
+	}
 
-		assert!(super::read_master_seed_hex(&path).is_err());
+	#[test]
+	fn boot_genesis_client_rejects_modified_echoed_request() {
+		let requested_set = GenesisSet {
+			members: vec![QuorumMember {
+				alias: "member-1".to_string(),
+				pub_key: P256Pair::generate().unwrap().public_key().to_bytes(),
+			}],
+			threshold: 1,
+		};
+		let requested_dr_key = Some(vec![7, 8, 9]);
+		let mut output = GenesisOutput {
+			set: requested_set.clone(),
+			dr_key: requested_dr_key.clone(),
+			quorum_key: vec![],
+			member_outputs: vec![],
+			recovery_permutations: vec![],
+			dr_key_wrapped_quorum_key: None,
+			quorum_key_hash: [0; 64],
+			test_message_ciphertext: vec![],
+			test_message_signature: vec![],
+			test_message: vec![],
+		};
+
+		assert!(
+			super::validate_genesis_output_matches_request(
+				&output,
+				&requested_set,
+				requested_dr_key.as_deref(),
+			)
+			.is_ok()
+		);
+
+		output.set.threshold = 2;
+		assert!(matches!(
+			super::validate_genesis_output_matches_request(
+				&output,
+				&requested_set,
+				requested_dr_key.as_deref(),
+			),
+			Err(super::Error::GenesisOutputDoesNotMatchRequest)
+		));
+
+		output.set = requested_set.clone();
+		output.dr_key = None;
+		assert!(matches!(
+			super::validate_genesis_output_matches_request(
+				&output,
+				&requested_set,
+				requested_dr_key.as_deref(),
+			),
+			Err(super::Error::GenesisOutputDoesNotMatchRequest)
+		));
 	}
 
 	struct Setup {
@@ -3254,11 +3364,15 @@ mod tests {
 	mod approve_manifest_human_verifications {
 		use super::*;
 		#[test]
-		fn human_verification_works() {
+		fn approval_view_includes_schema_debug_bridges_and_dns() {
 			let Setup { manifest, .. } = setup();
+			let manifest = v2_manifest_from(
+				&manifest,
+				Some(DnsConfig { resolvers: vec!["1.1.1.1".parse().unwrap()] }),
+			);
 
 			let mut vec_out = Vec::<u8>::new();
-			let vec_in = "yes\nyes\nyes\nyes\nyes\nyes\nyes\n".as_bytes();
+			let vec_in = "yes\nyes\nyes\nyes\nyes\nyes\nyes\nyes\n".as_bytes();
 
 			let mut prompter =
 				Prompter { reader: vec_in, writer: &mut vec_out };
@@ -3267,6 +3381,12 @@ mod tests {
 				&manifest,
 				&mut prompter
 			));
+
+			let output = String::from_utf8(vec_out).unwrap();
+			assert!(output.contains("manifest schema version: v2"));
+			assert!(output.contains("pivot debug mode: false"));
+			assert!(output.contains("pivot bridge configuration"));
+			assert!(output.contains("correct DNS resolvers"));
 		}
 
 		#[test]
@@ -3774,7 +3894,7 @@ mod tests {
 		}
 
 		#[test]
-		fn check_pcr3_preimage_against_manifest_enforces_match() {
+		fn rejects_manifest_pcr3_mismatch() {
 			let manifest_pcr3 = pcr3_from_preimage(ROLE_ARN);
 			assert!(
 				check_pcr3_preimage_against_manifest(ROLE_ARN, &manifest_pcr3)

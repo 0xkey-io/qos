@@ -164,6 +164,47 @@ fn legacy_protocol_msg_deserialization_discriminant_is_stable() {
 }
 
 #[test]
+fn malformed_proof_and_manifest_corpus_returns_error_without_panic_or_secret() {
+	const SECRET: &str = "SUPER_SECRET_PIN_seed";
+	let manifest_msg = CurrentProtocolMsg::BootStandardRequest {
+		manifest_envelope: Box::new(sample_manifest_envelope().into()),
+		pivot: vec![1, 2, 3],
+	};
+	let proof_msg = CurrentProtocolMsg::LiveAttestationDocResponse {
+		nsm_response: NsmResponse::LockPCR,
+		manifest_envelope: Some(Box::new(sample_manifest_envelope().into())),
+	};
+
+	let mut corpus = vec![
+		Vec::new(),
+		vec![u8::MAX],
+		b"{}".to_vec(),
+		br#"{"UnknownVariant":{}}"#.to_vec(),
+		format!(r#"{{"BootStandardRequest":{{"secret":"{SECRET}"}}}}"#)
+			.into_bytes(),
+		format!(r#"{{"LiveAttestationDocResponse":{{"secret":"{SECRET}"}}}}"#)
+			.into_bytes(),
+	];
+	for encoded in [
+		manifest_msg.to_borsh_wire().unwrap(),
+		proof_msg.to_borsh_wire().unwrap(),
+	] {
+		for cut in [0, 1, encoded.len() / 2, encoded.len() - 1] {
+			corpus.push(encoded[..cut].to_vec());
+		}
+	}
+
+	for bytes in corpus {
+		let result =
+			std::panic::catch_unwind(|| CurrentProtocolMsg::from_wire(&bytes));
+		let error = result
+			.expect("malformed wire input must not panic")
+			.expect_err("malformed wire input must fail closed");
+		assert!(!format!("{error:?}").contains(SECRET));
+	}
+}
+
+#[test]
 fn legacy_status_variants_decode() {
 	let req = decode_legacy(CurrentProtocolMsg::StatusRequest);
 	assert!(matches!(req, LegacyProtocolMsg::StatusRequest));
@@ -189,7 +230,7 @@ fn legacy_boot_standard_variants_decode() {
 }
 
 #[test]
-fn borsh_genesis_messages_are_rejected() {
+fn rejects_legacy_genesis_message() {
 	let request = CurrentProtocolMsg::BootGenesisRequest {
 		set: sample_genesis_set(),
 		dr_key: Some(vec![5; 33]),

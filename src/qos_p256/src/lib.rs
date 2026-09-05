@@ -702,19 +702,31 @@ mod test {
 	}
 
 	#[test]
-	fn master_seed_to_file_is_owner_only() {
+	fn secret_file_mode_is_0600_under_permissive_umask() {
 		use std::os::unix::fs::PermissionsExt as _;
 
-		let path = PathWrapper::from(
-			std::env::temp_dir().join("qos_seed_mode.secret"),
-		);
-		std::fs::write(&*path, b"stale").unwrap();
-		std::fs::set_permissions(
-			&*path,
-			std::fs::Permissions::from_mode(0o644),
-		)
-		.unwrap();
+		const CHILD_ENV: &str = "QOS_TEST_PERMISSIVE_UMASK_CHILD";
+		if std::env::var_os(CHILD_ENV).is_none() {
+			let status = std::process::Command::new("/bin/sh")
+				.arg("-c")
+				.arg(
+					"umask 000; exec \"$1\" --exact \
+				test::secret_file_mode_is_0600_under_permissive_umask --nocapture",
+				)
+				.arg("qos-umask-test")
+				.arg(std::env::current_exe().expect("current test binary"))
+				.env(CHILD_ENV, "1")
+				.status()
+				.expect("run isolated umask test");
+			assert!(status.success());
+			return;
+		}
 
+		let path = PathWrapper::from(
+			std::env::temp_dir()
+				.join(format!("qos_seed_mode_{}.secret", std::process::id())),
+		);
+		let _ = std::fs::remove_file(&*path);
 		let pair = P256Pair::generate().unwrap();
 		pair.to_hex_file(&*path).unwrap();
 
@@ -724,6 +736,7 @@ mod test {
 
 		let pair2 = P256Pair::from_hex_file(&*path).unwrap();
 		assert_eq!(pair.to_master_seed(), pair2.to_master_seed());
+		std::fs::remove_file(&*path).unwrap();
 	}
 
 	#[test]

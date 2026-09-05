@@ -1397,50 +1397,59 @@ mod test {
 		assert_eq!(err, ProtocolError::DuplicateApproval);
 	}
 
+	fn assert_duplicate_members_rejected(members: &[QuorumMember]) {
+		assert_eq!(
+			ensure_unique_members(members).unwrap_err(),
+			ProtocolError::DuplicateQuorumMember
+		);
+	}
+
 	#[test]
-	fn ensure_unique_members_rejects_shared_components() {
+	fn rejects_duplicate_member_alias() {
 		let pair_a = P256Pair::generate().unwrap();
 		let pair_b = P256Pair::generate().unwrap();
-		let pair_c = P256Pair::generate().unwrap();
 		let member = |alias: &str, pub_key: Vec<u8>| QuorumMember {
 			alias: alias.to_string(),
 			pub_key,
 		};
-
-		let distinct = vec![
+		assert_duplicate_members_rejected(&[
 			member("a", pair_a.public_key().to_bytes()),
-			member("b", pair_b.public_key().to_bytes()),
-		];
-		assert!(ensure_unique_members(&distinct).is_ok());
+			member("a", pair_b.public_key().to_bytes()),
+		]);
+	}
 
-		let duplicate_sets = [
-			// Same alias
-			vec![
-				member("a", pair_a.public_key().to_bytes()),
-				member("a", pair_b.public_key().to_bytes()),
-			],
-			// Same public key under different aliases
-			vec![
-				member("a", pair_a.public_key().to_bytes()),
-				member("b", pair_a.public_key().to_bytes()),
-			],
-			// Same signing component
-			vec![
-				member("a", mixed_public_key(&pair_b, &pair_a)),
-				member("b", mixed_public_key(&pair_c, &pair_a)),
-			],
-			// Same encryption component
-			vec![
-				member("a", mixed_public_key(&pair_a, &pair_b)),
-				member("b", mixed_public_key(&pair_a, &pair_c)),
-			],
-		];
-		for members in duplicate_sets {
-			assert_eq!(
-				ensure_unique_members(&members).unwrap_err(),
-				ProtocolError::DuplicateQuorumMember
-			);
-		}
+	#[test]
+	fn rejects_duplicate_signing_key() {
+		let pair_a = P256Pair::generate().unwrap();
+		let pair_b = P256Pair::generate().unwrap();
+		let pair_c = P256Pair::generate().unwrap();
+		assert_duplicate_members_rejected(&[
+			QuorumMember {
+				alias: "a".to_string(),
+				pub_key: mixed_public_key(&pair_b, &pair_a),
+			},
+			QuorumMember {
+				alias: "b".to_string(),
+				pub_key: mixed_public_key(&pair_c, &pair_a),
+			},
+		]);
+	}
+
+	#[test]
+	fn rejects_duplicate_encryption_key() {
+		let pair_a = P256Pair::generate().unwrap();
+		let pair_b = P256Pair::generate().unwrap();
+		let pair_c = P256Pair::generate().unwrap();
+		assert_duplicate_members_rejected(&[
+			QuorumMember {
+				alias: "a".to_string(),
+				pub_key: mixed_public_key(&pair_a, &pair_b),
+			},
+			QuorumMember {
+				alias: "b".to_string(),
+				pub_key: mixed_public_key(&pair_a, &pair_c),
+			},
+		]);
 	}
 
 	#[test]

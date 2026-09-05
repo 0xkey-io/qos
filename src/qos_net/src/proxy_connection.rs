@@ -218,6 +218,7 @@ mod test {
 	use super::*;
 
 	#[tokio::test]
+	#[ignore = "requires external network"]
 	async fn can_fetch_tls_content_with_proxy_connection() {
 		let host = "api.turnkey.com";
 		let path = "/health";

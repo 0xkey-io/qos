@@ -695,7 +695,7 @@ mod tests {
 	}
 
 	#[test]
-	fn declared_version_never_falls_back_to_an_older_schema() {
+	fn rejects_manifest_schema_version_mismatch() {
 		let pair = P256Pair::generate().unwrap();
 		let member = sample_member(&pair);
 

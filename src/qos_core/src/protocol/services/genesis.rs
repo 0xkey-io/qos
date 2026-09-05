@@ -367,7 +367,7 @@ mod test {
 	}
 
 	#[test]
-	fn boot_genesis_output_echoes_the_exact_request() {
+	fn rejects_modified_boot_genesis_request() {
 		let handles = Handles::new(
 			"EPH".to_string(),
 			"QUO".to_string(),

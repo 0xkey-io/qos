@@ -181,12 +181,16 @@ where
 #[cfg(test)]
 mod tests {
 	use std::{
-		env, ffi::OsString, fs, os::unix::net::UnixListener, path::Path,
+		env, ffi::OsString, fs,
+		io::Write,
+		os::unix::net::UnixListener,
+		path::Path,
 		thread, time::Duration,
 	};
 
 	use nitro_cli::common::{
-		EnclaveProcessCommandType, SOCKETS_DIR_PATH_ENV_VAR,
+		EnclaveProcessCommandType, MSG_ENCLAVE_CONFIRM,
+		SOCKETS_DIR_PATH_ENV_VAR,
 		commands_parser::EmptyArgs,
 	};
 
@@ -229,6 +233,60 @@ mod tests {
 			.unwrap();
 		}
 
+		assert_eq!(open_fd_count(), baseline);
+
+		let success_path = socket_dir.path().join("success.sock");
+		let listener = UnixListener::bind(&success_path).unwrap();
+		let server = thread::spawn(move || {
+			let (mut stream, _) = listener.accept().unwrap();
+			stream
+				.write_all(&MSG_ENCLAVE_CONFIRM.to_le_bytes())
+				.unwrap();
+		});
+		let (replies, errors) =
+			super::enclave_proc_command_send_all::<EmptyArgs>(
+				EnclaveProcessCommandType::Describe,
+				None,
+			)
+			.unwrap();
+		assert_eq!(replies.len(), 1);
+		assert_eq!(errors, 0);
+		drop(replies);
+		server.join().unwrap();
+		fs::remove_file(success_path).unwrap();
+		assert_eq!(open_fd_count(), baseline);
+
+		let partial_success_path =
+			socket_dir.path().join("partial-success.sock");
+		let partial_timeout_path =
+			socket_dir.path().join("partial-timeout.sock");
+		let success_listener =
+			UnixListener::bind(&partial_success_path).unwrap();
+		let timeout_listener =
+			UnixListener::bind(&partial_timeout_path).unwrap();
+		let success_server = thread::spawn(move || {
+			let (mut stream, _) = success_listener.accept().unwrap();
+			stream
+				.write_all(&MSG_ENCLAVE_CONFIRM.to_le_bytes())
+				.unwrap();
+		});
+		let timeout_server = thread::spawn(move || {
+			let (_stream, _) = timeout_listener.accept().unwrap();
+			thread::sleep(Duration::from_millis(3_500));
+		});
+		let (replies, errors) =
+			super::enclave_proc_command_send_all::<EmptyArgs>(
+				EnclaveProcessCommandType::Describe,
+				None,
+			)
+			.unwrap();
+		assert_eq!(replies.len(), 1);
+		assert_eq!(errors, 1);
+		drop(replies);
+		success_server.join().unwrap();
+		timeout_server.join().unwrap();
+		fs::remove_file(partial_success_path).unwrap();
+		fs::remove_file(partial_timeout_path).unwrap();
 		assert_eq!(open_fd_count(), baseline);
 
 		let listener =
