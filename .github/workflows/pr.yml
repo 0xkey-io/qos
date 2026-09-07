@@ -9,47 +9,133 @@ name: PR
 permissions:
   contents: read
 
+env:
+  RUSTUP_TOOLCHAIN: 1.94.0
+
 jobs:
-  test:
-    name: test
-    runs-on: ubicloud-standard-2
+  source:
+    name: source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      source_sha: ${{ steps.verify.outputs.source_sha }}
+      source_tree: ${{ steps.verify.outputs.source_tree }}
     steps:
-      - name: Checkout sources
+      - name: Checkout event source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
+      - name: Verify event source
+        id: verify
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          verification_log="$(mktemp "${RUNNER_TEMP}/pr-source-verification.XXXXXX")"
+          set +e
+          .github/scripts/pr-source-gate.sh "$GITHUB_WORKSPACE" 2>&1 | tee "$verification_log"
+          statuses=("${PIPESTATUS[@]}")
+          set -e
+          if [[ "${statuses[1]}" -ne 0 ]]; then
+            echo "source verification log capture failed with exit ${statuses[1]}" >&2
+            exit "${statuses[1]}"
+          fi
+          exit "${statuses[0]}"
+
+  test:
+    name: test
+    needs: source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.source.outputs.source_sha }}
+          persist-credentials: false
+      - name: Verify source and runner
+        env:
+          EXPECTED_SOURCE_SHA: ${{ needs.source.outputs.source_sha }}
+          EXPECTED_SOURCE_TREE: ${{ needs.source.outputs.source_tree }}
+        run: .github/scripts/verify-pr-source.sh
       - name: Install Rust
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: stable
+          toolchain: 1.94.0
+      - name: Verify Rust versions
+        run: |
+          rustc_version="$(rustc --version)"
+          cargo_version="$(cargo --version)"
+          printf '%s\n%s\n' "$rustc_version" "$cargo_version"
+          [[ "$rustc_version" == 'rustc 1.94.0 '* ]]
+          [[ "$cargo_version" == 'cargo 1.94.0 '* ]]
+      - name: Run local workflow and helper tests
+        run: |
+          bash .github/tests/test_exact_source_fd_gate.sh
+          bash .github/tests/test_pr_source_gate.sh
+          bash .github/tests/test_verify_pr_source.sh
+          ruby .github/tests/test_workflow_boundaries.rb
+          ruby .github/tests/test_linux_only_locked_builds.rb
+          ruby .github/tests/test_pr_workflow_contract.rb
+          ruby .github/tests/test_pr_quality_decision.rb
       - name: Install Linux deps
         run: sudo apt-get update && sudo apt-get install -y pkg-config libpcsclite-dev
       - name: Run tests
         run: make -C src test
       - name: Run legacy protocol compat tests
         run: cargo test --locked -p integration --features legacy-protocol-compat --test protocol_legacy_decode
+      - name: Verify tracked tree remains clean
+        env:
+          EXPECTED_SOURCE_SHA: ${{ needs.source.outputs.source_sha }}
+          EXPECTED_SOURCE_TREE: ${{ needs.source.outputs.source_tree }}
+        run: .github/scripts/verify-pr-source.sh
 
   lint:
     name: lint
-    runs-on: ubicloud-standard-2
+    needs: source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - name: Checkout sources
+      - name: Checkout exact source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ needs.source.outputs.source_sha }}
           persist-credentials: false
+      - name: Verify source and runner
+        env:
+          EXPECTED_SOURCE_SHA: ${{ needs.source.outputs.source_sha }}
+          EXPECTED_SOURCE_TREE: ${{ needs.source.outputs.source_tree }}
+        run: .github/scripts/verify-pr-source.sh
       - name: Install Rust
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: stable
+          toolchain: 1.94.0
           components: clippy,rustfmt
+      - name: Verify Rust versions
+        run: |
+          rustc_version="$(rustc --version)"
+          cargo_version="$(cargo --version)"
+          printf '%s\n%s\n' "$rustc_version" "$cargo_version"
+          [[ "$rustc_version" == 'rustc 1.94.0 '* ]]
+          [[ "$cargo_version" == 'cargo 1.94.0 '* ]]
       - name: Install Linux deps
         run: sudo apt-get update && sudo apt-get install -y pkg-config libpcsclite-dev
       - name: Run linting
         run: make -C src lint
+      - name: Verify tracked tree remains clean
+        env:
+          EXPECTED_SOURCE_SHA: ${{ needs.source.outputs.source_sha }}
+          EXPECTED_SOURCE_TREE: ${{ needs.source.outputs.source_tree }}
+        run: .github/scripts/verify-pr-source.sh
 
   check-publishable-crates-standalone:
     name: check-publishable-crates-standalone (${{ matrix.package }})
-    runs-on: ubicloud-standard-2
+    needs: source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -64,14 +150,27 @@ jobs:
           - qos_test_primitives
           - qos_json
     steps:
-      - name: Checkout sources
+      - name: Checkout exact source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ needs.source.outputs.source_sha }}
           persist-credentials: false
+      - name: Verify source and runner
+        env:
+          EXPECTED_SOURCE_SHA: ${{ needs.source.outputs.source_sha }}
+          EXPECTED_SOURCE_TREE: ${{ needs.source.outputs.source_tree }}
+        run: .github/scripts/verify-pr-source.sh
       - name: Install Rust
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: stable
+          toolchain: 1.94.0
+      - name: Verify Rust versions
+        run: |
+          rustc_version="$(rustc --version)"
+          cargo_version="$(cargo --version)"
+          printf '%s\n%s\n' "$rustc_version" "$cargo_version"
+          [[ "$rustc_version" == 'rustc 1.94.0 '* ]]
+          [[ "$cargo_version" == 'cargo 1.94.0 '* ]]
       - name: Install Linux deps
         run: sudo apt-get update && sudo apt-get install -y pkg-config libpcsclite-dev
       - name: Check publishable crates standalone
@@ -81,21 +180,118 @@ jobs:
       - name: Install cargo-hack
         uses: taiki-e/install-action@50414676f9f5d50a65992c6dd2ed02641263226c # v2.82.10
         with:
-          tool: cargo-hack
+          tool: cargo-hack@0.6.45
+      - name: Verify cargo-hack version
+        run: |
+          cargo_hack_version="$(cargo hack --version)"
+          echo "$cargo_hack_version"
+          [[ "$cargo_hack_version" == 'cargo-hack 0.6.45' ]]
       - name: Check feature combinations
         run: |
           cargo fetch --locked
-          cargo hack check --offline --feature-powerset --no-dev-deps -p ${{ matrix.package }}
+          cargo hack check --locked --offline --feature-powerset --no-dev-deps -p ${{ matrix.package }}
+      - name: Verify tracked tree remains clean
+        env:
+          EXPECTED_SOURCE_SHA: ${{ needs.source.outputs.source_sha }}
+          EXPECTED_SOURCE_TREE: ${{ needs.source.outputs.source_tree }}
+        run: .github/scripts/verify-pr-source.sh
 
   build-linux-only-crates:
     name: build-linux-only-crates
-    runs-on: ubicloud-standard-8
+    needs: source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
-      - name: Checkout sources
+      - name: Checkout exact source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ needs.source.outputs.source_sha }}
           persist-credentials: false
-      - name: Setup Docker
-        uses: ./.github/actions/docker-setup
+      - name: Verify source and runner
+        env:
+          EXPECTED_SOURCE_SHA: ${{ needs.source.outputs.source_sha }}
+          EXPECTED_SOURCE_TREE: ${{ needs.source.outputs.source_tree }}
+        run: .github/scripts/verify-pr-source.sh
+      - name: Setup isolated Docker
+        uses: docker/setup-docker-action@e43656e248c0bd0647d3f5c195d116aacf6fcaf4
+        with:
+          version: v28.0.4
+          context: qos-validation
+          github-token: ""
+          daemon-config: |
+            {"features":{"containerd-snapshotter":true}}
+      - name: Verify Docker and create isolated builder
+        run: |
+          [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          [[ "$(docker context show)" == 'qos-validation' ]]
+          docker version
+          server_version="$(docker version --format '{{.Server.Version}}')"
+          echo "docker_server_version=$server_version"
+          [[ "$server_version" == '28.0.4' ]]
+          driver_status="$(docker info --format 'driver={{.Driver}} driver_status={{json .DriverStatus}}')"
+          echo "$driver_status"
+          [[ "$driver_status" == *'io.containerd.snapshotter.v1'* ]]
+          docker buildx version
+          builder="qos-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker buildx create --name "$builder" --driver docker-container --use
+          BUILDX_BUILDER="$builder"
+          export BUILDX_BUILDER
+          echo "BUILDX_BUILDER=$BUILDX_BUILDER" >>"$GITHUB_ENV"
+          docker buildx inspect "$builder" --bootstrap
+          mapfile -t buildkit_containers < <(docker ps -aq --filter "label=com.docker.buildx.builder=$builder")
+          [[ "${#buildkit_containers[@]}" -eq 1 ]]
+          docker inspect --format 'buildkit_image_ref={{.Config.Image}} buildkit_image_id={{.Image}}' "${buildkit_containers[0]}"
       - name: Run build-linux-only
-        run: make -j$(nproc) build-linux-only
+        run: make -j"$(nproc)" build-linux-only
+      - name: Verify tracked tree remains clean
+        env:
+          EXPECTED_SOURCE_SHA: ${{ needs.source.outputs.source_sha }}
+          EXPECTED_SOURCE_TREE: ${{ needs.source.outputs.source_tree }}
+        run: .github/scripts/verify-pr-source.sh
+      - name: Remove isolated builder
+        if: ${{ always() }}
+        run: |
+          [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          builder="qos-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          [[ "${BUILDX_BUILDER:-$builder}" == "$builder" ]]
+          docker buildx rm "$builder"
+
+  quality:
+    name: quality
+    if: ${{ always() }}
+    needs:
+      - source
+      - test
+      - lint
+      - check-publishable-crates-standalone
+      - build-linux-only-crates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      SOURCE_SHA: ${{ needs.source.outputs.source_sha }}
+      SOURCE_TREE: ${{ needs.source.outputs.source_tree }}
+      RESULT_SOURCE: ${{ needs.source.result }}
+      RESULT_TEST: ${{ needs.test.result }}
+      RESULT_LINT: ${{ needs.lint.result }}
+      RESULT_MATRIX: ${{ needs.check-publishable-crates-standalone.result }}
+      RESULT_LINUX: ${{ needs.build-linux-only-crates.result }}
+    steps:
+      - name: Enforce aggregate quality
+        run: |
+          valid=true
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || valid=false
+          [[ "$SOURCE_TREE" =~ ^[0-9a-f]{40}$ ]] || valid=false
+          for result in "$RESULT_SOURCE" "$RESULT_TEST" "$RESULT_LINT" "$RESULT_MATRIX" "$RESULT_LINUX"; do
+            [[ "$result" == 'success' ]] || valid=false
+          done
+          {
+            printf 'event=%s\nref=%s\nsource_sha=%s\nsource_tree=%s\n' \
+              "$GITHUB_EVENT_NAME" "$GITHUB_REF" "$SOURCE_SHA" "$SOURCE_TREE"
+            printf 'source=%s\ntest=%s\nlint=%s\nmatrix=%s\nlinux=%s\n' \
+              "$RESULT_SOURCE" "$RESULT_TEST" "$RESULT_LINT" "$RESULT_MATRIX" "$RESULT_LINUX"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          statuses=("${PIPESTATUS[@]}")
+          [[ "${statuses[1]}" -eq 0 ]]
+          [[ "$valid" == true ]]
