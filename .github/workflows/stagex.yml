@@ -14,6 +14,7 @@ on:
 jobs:
   build:
     name: build ${{ matrix.name }}
+    if: github.repository_owner == 'tkhq'
     runs-on: ubicloud-standard-16
     strategy:
       # One job per image so builds/pushes run in parallel. Don't cancel the
@@ -131,7 +132,7 @@ jobs:
   build-artifacts:
     name: build artifacts
     needs: build
-    if: always()
+    if: github.repository_owner == 'tkhq' && always()
     runs-on: ubicloud-standard-2
     steps:
       - name: Verify all image builds succeeded
@@ -144,7 +145,7 @@ jobs:
 
   qemu-e2e:
     name: QEMU e2e with PR images
-    if: github.event_name == 'pull_request'
+    if: github.repository_owner == 'tkhq' && github.event_name == 'pull_request'
     needs: build-artifacts
     uses: ./.github/workflows/qemu-e2e.yml
     with:

@@ -17,6 +17,7 @@ on:
 jobs:
   build:
     name: build ${{ matrix.name }}
+    if: github.repository_owner == 'tkhq'
     runs-on: ubicloud-standard-16
     strategy:
       # One job per image so builds/pushes run in parallel. Don't cancel the

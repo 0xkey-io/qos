@@ -20,6 +20,7 @@ on:
 jobs:
   publish:
     name: publish signed_echo image
+    if: github.repository_owner == 'tkhq'
     runs-on: ubicloud-standard-16
     permissions:
       contents: read
