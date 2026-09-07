@@ -81,7 +81,7 @@ make -C src test
 
 All tests must pass.
 
-PRs also need to pass the `build-linux-only` job (part of the `pr` workflow). There are 3 crates excluded from the Rust workspace: `qos_system`, `qos_aws`, and `init`. These crates are excluded because they only build on Linux. If you are not working directly with these crates they generally only need to be updated if the dependencies for `qos_core` change. The linux only crates each have their own lockfile and that will need to be up to date for deterministic builds to work. To update the locks files you will need a linux build environment. Once in a linux build environment you can run `make build-linux-only`, which updates lock files if necessary; any updated lock files should then be committed.
+PRs also need to pass the `build-linux-only` job (part of the `pr` workflow). There are 3 crates excluded from the Rust workspace: `qos_system`, `qos_aws`, and `init`. These crates are excluded because they only build on Linux. If you are not working directly with these crates they generally only need to be updated if the dependencies for `qos_core` change. The linux only crates each have their own lockfile and that will need to be up to date for deterministic builds to work. Deliberately refresh stale lock files with Cargo in a Linux build environment, then review and commit those changes. `make build-linux-only` verifies the committed locks with `--locked` and fails if they need updating.
 
 ### Running in qemu
 
