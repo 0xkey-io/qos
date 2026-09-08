@@ -77,6 +77,8 @@ jobs:
           bash .github/tests/test_exact_source_fd_gate.sh
           bash .github/tests/test_pr_source_gate.sh
           bash .github/tests/test_verify_pr_source.sh
+          bash .github/tests/test_buildx_container_gate.sh
+          bash .github/tests/test_no_dev_feature_powerset.sh
           ruby .github/tests/test_workflow_boundaries.rb
           ruby .github/tests/test_linux_only_locked_builds.rb
           ruby .github/tests/test_pr_workflow_contract.rb
@@ -189,7 +191,7 @@ jobs:
       - name: Check feature combinations
         run: |
           cargo fetch --locked
-          cargo hack check --locked --offline --feature-powerset --no-dev-deps -p ${{ matrix.package }}
+          .github/scripts/check-no-dev-feature-powerset.sh "${{ matrix.package }}"
       - name: Verify tracked tree remains clean
         env:
           EXPECTED_SOURCE_SHA: ${{ needs.source.outputs.source_sha }}
@@ -234,14 +236,13 @@ jobs:
           [[ "$driver_status" == *'io.containerd.snapshotter.v1'* ]]
           docker buildx version
           builder="qos-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          docker buildx create --name "$builder" --driver docker-container --use
+          node="$builder"
+          docker buildx create --name "$builder" --node "$node" --driver docker-container --use qos-validation
           BUILDX_BUILDER="$builder"
           export BUILDX_BUILDER
           echo "BUILDX_BUILDER=$BUILDX_BUILDER" >>"$GITHUB_ENV"
           docker buildx inspect "$builder" --bootstrap
-          mapfile -t buildkit_containers < <(docker ps -aq --filter "label=com.docker.buildx.builder=$builder")
-          [[ "${#buildkit_containers[@]}" -eq 1 ]]
-          docker inspect --format 'buildkit_image_ref={{.Config.Image}} buildkit_image_id={{.Image}}' "${buildkit_containers[0]}"
+          .github/scripts/verify-buildx-container.sh "$builder" "$node" qos-validation
       - name: Run build-linux-only
         run: make -j"$(nproc)" build-linux-only
       - name: Verify tracked tree remains clean

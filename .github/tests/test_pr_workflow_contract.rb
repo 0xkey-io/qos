@@ -62,7 +62,7 @@ class PrWorkflowContractTest < Minitest::Test
     assert_includes runs_for("lint"), "make -C src lint"
     assert_includes runs_for("check-publishable-crates-standalone"), "cargo check --locked -p ${{ matrix.package }}"
     assert_includes runs_for("check-publishable-crates-standalone"), "cargo fetch --locked"
-    assert_includes runs_for("check-publishable-crates-standalone"), "cargo hack check --locked --offline --feature-powerset --no-dev-deps -p ${{ matrix.package }}"
+    assert_includes runs_for("check-publishable-crates-standalone"), '.github/scripts/check-no-dev-feature-powerset.sh "${{ matrix.package }}"'
     assert_includes runs_for("build-linux-only-crates"), 'make -j"$(nproc)" build-linux-only'
     assert_equal %w[qos_client qos_core qos_crypto qos_hex qos_net qos_p256 qos_nsm qos_test_primitives qos_json],
                  @jobs.dig("check-publishable-crates-standalone", "strategy", "matrix", "package")
@@ -98,7 +98,8 @@ class PrWorkflowContractTest < Minitest::Test
     assert_includes runs_for("check-publishable-crates-standalone"), "cargo hack --version"
     test_runs = runs_for("test")
     %w[test_exact_source_fd_gate.sh test_pr_source_gate.sh test_verify_pr_source.sh test_workflow_boundaries.rb
-       test_linux_only_locked_builds.rb test_pr_workflow_contract.rb test_pr_quality_decision.rb].each do |test|
+       test_buildx_container_gate.sh test_no_dev_feature_powerset.sh test_linux_only_locked_builds.rb
+       test_pr_workflow_contract.rb test_pr_quality_decision.rb].each do |test|
       assert_includes test_runs, test
     end
   end
@@ -128,9 +129,15 @@ class PrWorkflowContractTest < Minitest::Test
     assert_includes runs, "[[ \"$driver_status\" == *'io.containerd.snapshotter.v1'* ]]"
     assert_includes runs, "docker buildx version"
     assert_includes runs, 'builder="qos-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"'
+    assert_includes runs, 'node="$builder"'
     assert_includes runs, 'BUILDX_BUILDER="$builder"'
     assert_includes runs, 'docker buildx inspect "$builder" --bootstrap'
+    assert_includes runs, '.github/scripts/verify-buildx-container.sh "$builder" "$node" qos-validation'
     assert_includes runs, 'docker buildx rm "$builder"'
+    refute_includes runs, "label=com.docker.buildx.builder"
+    cleanup = job.fetch("steps").find { |step| step["name"] == "Remove isolated builder" }
+    assert_equal "${{ always() }}", cleanup.fetch("if")
+    refute_includes cleanup.fetch("run"), "|| true"
     refute_match(/prune|tcp:\/\/|docker login|registry-mirror/i, runs)
   end
 
