@@ -97,7 +97,8 @@ class PrWorkflowContractTest < Minitest::Test
     assert_equal "cargo-hack@0.6.45", install.dig("with", "tool")
     assert_includes runs_for("check-publishable-crates-standalone"), "cargo hack --version"
     test_runs = runs_for("test")
-    %w[test_exact_source_fd_gate.sh test_pr_source_gate.sh test_verify_pr_source.sh test_workflow_boundaries.rb
+    %w[test_exact_source_fd_gate.sh test_qemu_local_gate.sh test_qemu_local_workflow.rb
+       test_pr_source_gate.sh test_verify_pr_source.sh test_workflow_boundaries.rb
        test_buildx_container_gate.sh test_no_dev_feature_powerset.sh test_linux_only_locked_builds.rb
        test_pr_workflow_contract.rb test_pr_quality_decision.rb].each do |test|
       assert_includes test_runs, test

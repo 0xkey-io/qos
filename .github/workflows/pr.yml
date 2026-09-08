@@ -75,11 +75,13 @@ jobs:
       - name: Run local workflow and helper tests
         run: |
           bash .github/tests/test_exact_source_fd_gate.sh
+          bash .github/tests/test_qemu_local_gate.sh
           bash .github/tests/test_pr_source_gate.sh
           bash .github/tests/test_verify_pr_source.sh
           bash .github/tests/test_buildx_container_gate.sh
           bash .github/tests/test_no_dev_feature_powerset.sh
           ruby .github/tests/test_workflow_boundaries.rb
+          ruby .github/tests/test_qemu_local_workflow.rb
           ruby .github/tests/test_linux_only_locked_builds.rb
           ruby .github/tests/test_pr_workflow_contract.rb
           ruby .github/tests/test_pr_quality_decision.rb

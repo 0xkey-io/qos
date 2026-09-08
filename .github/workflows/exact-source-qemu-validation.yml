@@ -1,0 +1,122 @@
+name: Exact-source local QEMU validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact 40-character lowercase source commit SHA
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_SHA: ${{ inputs.source_sha }}
+  CONTROLLER_DIR: ${{ github.workspace }}/controller
+  SOURCE_DIR: ${{ github.workspace }}/source
+
+jobs:
+  qemu-gate:
+    name: Exact-source local QEMU gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout workflow controller
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          path: controller
+          persist-credentials: false
+
+      - name: Reject malformed source SHA
+        run: '"${CONTROLLER_DIR}/.github/scripts/qemu-local-gate.sh" validate-sha'
+
+      - name: Checkout exact source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          path: source
+          persist-credentials: false
+
+      - name: Create run-owned evidence directory
+        run: |
+          state_dir="$(mktemp -d "${RUNNER_TEMP}/qos-qemu-state.XXXXXX")"
+          printf 'STATE_DIR=%s\n' "$state_dir" >>"$GITHUB_ENV"
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: 1.94.0
+
+      - name: Install host test prerequisites
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libpcsclite-dev
+
+      - name: Verify exact source and all lock domains
+        run: '"${CONTROLLER_DIR}/.github/scripts/qemu-local-gate.sh" preflight'
+
+      - name: Setup isolated Docker
+        uses: docker/setup-docker-action@e43656e248c0bd0647d3f5c195d116aacf6fcaf4
+        with:
+          version: v28.0.4
+          context: qos-validation
+          github-token: ""
+          daemon-config: |
+            {"features":{"containerd-snapshotter":true}}
+
+      - name: Verify Docker and create isolated builder
+        run: |
+          [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          [[ "$(docker context show)" == 'qos-validation' ]]
+          docker version
+          server_version="$(docker version --format '{{.Server.Version}}')"
+          printf 'docker_server_version=%s\n' "$server_version"
+          [[ "$server_version" == '28.0.4' ]]
+          driver_status="$(docker info --format 'driver={{.Driver}} driver_status={{json .DriverStatus}}')"
+          printf '%s\n' "$driver_status"
+          [[ "$driver_status" == *'io.containerd.snapshotter.v1'* ]]
+          docker buildx version
+          builder="qos-qemu-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          node="$builder"
+          docker buildx create --name "$builder" --node "$node" --driver docker-container --use qos-validation
+          printf 'BUILDX_BUILDER=%s\n' "$builder" >>"$GITHUB_ENV"
+          export BUILDX_BUILDER="$builder"
+          docker buildx inspect "$builder" --bootstrap
+          "${CONTROLLER_DIR}/.github/scripts/verify-buildx-container.sh" \
+            "$builder" "$node" qos-validation
+
+      - name: Build and load five local candidate images
+        run: '"${CONTROLLER_DIR}/.github/scripts/qemu-local-gate.sh" build-load'
+
+      - name: Run exact two-test QEMU gate
+        env:
+          QOS_TEST_QEMU_ENCLAVE_IMAGE: qos-local/qos_enclave_egress:latest
+          QOS_TEST_QEMU_HOST_IMAGE: qos-local/qos_host_qemu:latest
+          QOS_TEST_QEMU_BRIDGE_IMAGE: qos-local/qos_bridge_qemu:latest
+          QOS_TEST_QEMU_CLIENT_IMAGE: qos-local/qos_client:latest
+          QOS_TEST_QEMU_PIVOT_IMAGE: qos-local/signed_echo:latest
+        run: '"${CONTROLLER_DIR}/.github/scripts/qemu-local-gate.sh" run-tests'
+
+      - name: Verify final source and lock identities
+        if: ${{ always() }}
+        run: '"${CONTROLLER_DIR}/.github/scripts/qemu-local-gate.sh" verify-final'
+
+      - name: Clean run-owned resources
+        if: ${{ always() }}
+        run: '"${CONTROLLER_DIR}/.github/scripts/qemu-local-gate.sh" cleanup'
+
+      - name: Remove isolated builder
+        if: ${{ always() }}
+        run: |
+          [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          builder="qos-qemu-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          if [[ -n "${BUILDX_BUILDER:-}" ]]; then
+            [[ "$BUILDX_BUILDER" == "$builder" ]]
+            docker buildx rm "$builder"
+          elif command -v docker >/dev/null 2>&1 && docker buildx inspect "$builder" >/dev/null 2>&1; then
+            docker buildx rm "$builder"
+          else
+            printf 'buildx_builder=%s outcome=absent\n' "$builder"
+          fi
