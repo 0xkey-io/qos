@@ -14,18 +14,31 @@ safe_name='^[A-Za-z0-9][A-Za-z0-9_.-]*$'
 [[ "$expected_node" =~ $safe_name ]] || die 'node must use safe name characters'
 [[ "$expected_endpoint" =~ $safe_name ]] || die 'endpoint must use safe name characters'
 
-node_format='{{range .Nodes}}{{printf "%s\t%s\t%s\n" .Name .Endpoint .Status}}{{end}}'
-if ! node_output="$(docker buildx inspect "$builder" --format "$node_format" 2>&1)"; then
-  die "docker buildx inspect failed: ${node_output}"
+node_format='{{printf "%s\t%s\t%s\t%s\n" .Builder.Name .Name .DriverEndpoint .Status}}'
+if ! node_output="$(docker buildx ls --format "$node_format" --no-trunc 2>&1)"; then
+  die "docker buildx ls failed: ${node_output}"
 fi
+builder_records=()
 node_records=()
 while IFS= read -r record; do
-  [[ -z "$record" ]] || node_records+=("$record")
+  [[ -z "$record" ]] && continue
+  IFS=$'\t' read -r actual_builder actual_name actual_driver_endpoint actual_status extra <<<"$record"
+  [[ -z "${extra:-}" ]] || die 'Buildx list record has unexpected fields'
+  [[ -n "$actual_builder" && -n "$actual_name" && -n "$actual_driver_endpoint" ]] || \
+    die 'Buildx list record is incomplete'
+  [[ "$actual_builder" == "$builder" ]] || continue
+  if [[ "$actual_name" == "$builder" && -z "$actual_status" ]]; then
+    builder_records+=("$record")
+  else
+    node_records+=("$record")
+  fi
 done <<<"$node_output"
+[[ "${#builder_records[@]}" -eq 1 ]] || \
+  die "expected exactly one matching Buildx builder, found ${#builder_records[@]} (builder=${builder})"
 [[ "${#node_records[@]}" -eq 1 ]] || \
   die "expected exactly one Buildx node, found ${#node_records[@]} (builder=${builder}, expected_node=${expected_node})"
 
-IFS=$'\t' read -r actual_node actual_endpoint actual_status extra <<<"${node_records[0]}"
+IFS=$'\t' read -r actual_builder actual_node actual_endpoint actual_status extra <<<"${node_records[0]}"
 [[ -z "${extra:-}" ]] || die 'Buildx node record has unexpected fields'
 [[ "$actual_node" == "$expected_node" ]] || \
   die "unexpected Buildx node name (expected=${expected_node}, actual=${actual_node:-<empty>})"
