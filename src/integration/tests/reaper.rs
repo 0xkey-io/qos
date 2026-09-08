@@ -4,17 +4,17 @@ use std::{
 };
 
 use integration::{
-	wait_for_tcp_sock, wait_for_usock, PIVOT_ABORT_PATH, PIVOT_OK2_PATH,
-	PIVOT_OK2_SUCCESS_FILE, PIVOT_OK_PATH, PIVOT_PANIC_PATH, PIVOT_TCP_PATH,
+	PIVOT_ABORT_PATH, PIVOT_OK_PATH, PIVOT_OK2_PATH, PIVOT_OK2_SUCCESS_FILE,
+	PIVOT_PANIC_PATH, PIVOT_TCP_PATH, wait_for_tcp_sock, wait_for_usock,
 };
 use qos_core::{
 	handles::Handles,
 	io::{HostBridge, SocketAddress, StreamPool},
 	protocol::services::boot::{BridgeConfig, ManifestEnvelope},
-	reaper::{Reaper, REAPER_EXIT_DELAY},
+	reaper::{REAPER_EXIT_DELAY, Reaper},
 };
 use qos_nsm::mock::MockNsm;
-use qos_test_primitives::{find_free_port, PathWrapper};
+use qos_test_primitives::{PathWrapper, find_free_port};
 use tokio::{
 	io::{AsyncReadExt, AsyncWriteExt},
 	net::TcpStream,
@@ -32,8 +32,8 @@ async fn reaper_works() {
 
 	let handles = Handles::new(
 		"eph_path".to_string(),
-		secret_path.to_str().map(ToString::to_string).unwrap(),
-		manifest_path.to_str().map(ToString::to_string).unwrap(),
+		secret_path.display().to_string(),
+		manifest_path.display().to_string(),
 		PIVOT_OK_PATH.to_string(),
 	);
 
@@ -49,8 +49,13 @@ async fn reaper_works() {
 	let enclave_socket = SocketAddress::new_unix(&usock);
 
 	let reaper_handle = tokio::spawn(async move {
-		Reaper::execute(&handles, Box::new(MockNsm), enclave_socket, None)
-			.await;
+		Reaper::execute(
+			&handles,
+			Box::new(MockNsm::new()),
+			enclave_socket,
+			None,
+		)
+		.await;
 	});
 
 	// Give the enclave server time to bind to the socket
@@ -72,6 +77,7 @@ async fn reaper_works() {
 }
 
 #[tokio::test]
+#[allow(unsafe_code)]
 async fn reaper_clears_host_env() {
 	let secret_path = PathWrapper::from("/tmp/reaper_clears_host_env.secret");
 	let usock = PathWrapper::from("/tmp/reaper_clears_host_env.sock");
@@ -81,12 +87,14 @@ async fn reaper_clears_host_env() {
 	let host_only_env_key = "QOS_TEST_REAPER_HOST_ONLY_ENV";
 
 	drop(fs::remove_file(&*secret_path));
-	std::env::set_var(host_only_env_key, "must-not-leak");
+	// SAFETY: This test is not marked multi_thread and no other thread
+	// reads this env var concurrently at this point.
+	unsafe { std::env::set_var(host_only_env_key, "must-not-leak") };
 
 	let handles = Handles::new(
 		"reaper_clears_host_env.eph".to_string(),
-		secret_path.to_str().map(ToString::to_string).unwrap(),
-		manifest_path.to_str().map(ToString::to_string).unwrap(),
+		secret_path.display().to_string(),
+		manifest_path.display().to_string(),
 		PIVOT_OK2_PATH.to_string(),
 	);
 
@@ -103,8 +111,13 @@ async fn reaper_clears_host_env() {
 
 	let enclave_socket = SocketAddress::new_unix(&usock);
 	let reaper_handle = tokio::spawn(async move {
-		Reaper::execute(&handles, Box::new(MockNsm), enclave_socket, None)
-			.await;
+		Reaper::execute(
+			&handles,
+			Box::new(MockNsm::new()),
+			enclave_socket,
+			None,
+		)
+		.await;
 	});
 
 	wait_for_usock(&usock).await;
@@ -116,7 +129,8 @@ async fn reaper_clears_host_env() {
 	let contents = fs::read(PIVOT_OK2_SUCCESS_FILE).unwrap();
 	assert_eq!(std::str::from_utf8(&contents).unwrap(), msg);
 	assert!(fs::remove_file(PIVOT_OK2_SUCCESS_FILE).is_ok());
-	std::env::remove_var(host_only_env_key);
+	// SAFETY: Matching the set_var above; test is single-threaded.
+	unsafe { std::env::remove_var(host_only_env_key) };
 }
 
 // TODO(json-pr): restore this manifest env test when the JSON manifest PR
@@ -168,7 +182,7 @@ async fn reaper_clears_host_env() {
 //
 // 	let enclave_socket = SocketAddress::new_unix(&usock);
 // 	let reaper_handle = tokio::spawn(async move {
-// 		Reaper::execute(&handles, Box::new(MockNsm), enclave_socket, None)
+// 		Reaper::execute(&handles, Box::new(MockNsm::new()), enclave_socket, None)
 // 			.await;
 // 	});
 //
@@ -200,21 +214,26 @@ async fn reaper_handles_non_zero_exits() {
 
 	let handles = Handles::new(
 		"eph_path".to_string(),
-		secret_path.to_str().map(ToString::to_string).unwrap(),
-		manifest_path.to_str().map(ToString::to_string).unwrap(),
+		secret_path.display().to_string(),
+		manifest_path.display().to_string(),
 		PIVOT_ABORT_PATH.to_string(),
 	);
 
 	// Make sure we have written everything necessary to pivot, except the
 	// quorum key
-	handles.put_manifest_envelope(&Default::default()).unwrap();
+	handles.put_manifest_envelope(ManifestEnvelope::default()).unwrap();
 	assert!(handles.pivot_exists());
 
 	let enclave_socket = SocketAddress::new_unix(&usock);
 
 	let reaper_handle = tokio::spawn(async move {
-		Reaper::execute(&handles, Box::new(MockNsm), enclave_socket, None)
-			.await;
+		Reaper::execute(
+			&handles,
+			Box::new(MockNsm::new()),
+			enclave_socket,
+			None,
+		)
+		.await;
 	});
 
 	// Give the enclave server time to bind to the socket
@@ -247,21 +266,26 @@ async fn reaper_handles_panic() {
 
 	let handles = Handles::new(
 		"eph_path".to_string(),
-		secret_path.to_str().map(ToString::to_string).unwrap(),
-		manifest_path.to_str().map(ToString::to_string).unwrap(),
+		secret_path.display().to_string(),
+		manifest_path.display().to_string(),
 		PIVOT_PANIC_PATH.to_string(),
 	);
 
 	// Make sure we have written everything necessary to pivot, except the
 	// quorum key
-	handles.put_manifest_envelope(&Default::default()).unwrap();
+	handles.put_manifest_envelope(ManifestEnvelope::default()).unwrap();
 	assert!(handles.pivot_exists());
 
 	let enclave_socket = SocketAddress::new_unix(&usock);
 
 	let reaper_handle = tokio::spawn(async move {
-		Reaper::execute(&handles, Box::new(MockNsm), enclave_socket, None)
-			.await;
+		Reaper::execute(
+			&handles,
+			Box::new(MockNsm::new()),
+			enclave_socket,
+			None,
+		)
+		.await;
 	});
 
 	// Give the enclave server time to bind to the socket
@@ -299,8 +323,8 @@ async fn reaper_handles_bridge() {
 
 	let handles = Handles::new(
 		"eph_path".to_string(),
-		secret_path.to_str().map(ToString::to_string).unwrap(),
-		manifest_path.to_str().map(ToString::to_string).unwrap(),
+		secret_path.display().to_string(),
+		manifest_path.display().to_string(),
 		PIVOT_TCP_PATH.to_string(),
 	);
 
@@ -327,8 +351,13 @@ async fn reaper_handles_bridge() {
 	let enclave_socket = SocketAddress::new_unix(&usock);
 
 	let reaper_handle = tokio::spawn(async move {
-		Reaper::execute(&handles, Box::new(MockNsm), enclave_socket, None)
-			.await;
+		Reaper::execute(
+			&handles,
+			Box::new(MockNsm::new()),
+			enclave_socket,
+			None,
+		)
+		.await;
 	});
 
 	// wait for enclave to listen

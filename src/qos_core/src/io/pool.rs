@@ -151,7 +151,7 @@ impl StreamPool {
 	///
 	/// # Panics
 	/// Panics if list of addresses provided was empty.
-	pub async fn get(&self) -> PoolGuard {
+	pub async fn get(&self) -> PoolGuard<'_> {
 		// TODO: make this into an error
 		assert!(
 			!self.handles.is_empty(),
@@ -282,11 +282,11 @@ impl SocketAddress {
 					Err(IOError::PoolError(PoolError::InvalidSourceAddress))
 				}
 			},
-			#[cfg(feature = "vm")]
+			#[cfg(not(target_os = "macos"))]
 			Self::Vsock(vsock) => Ok(Self::new_vsock(
 				vsock.cid(),
 				vsock.port() + 1,
-				super::vsock_svm_flags(*vsock),
+				super::vsock_svm_flags(vsock),
 			)),
 		}
 	}
@@ -335,7 +335,7 @@ mod test {
 		let server_task = tokio::task::spawn(async move {
 			let _stream = server.accept().await.unwrap();
 			// give the call time to connect and hang
-			tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+			tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 		});
 
 		let pool = StreamPool::new(server_addr, 1).unwrap().shared();

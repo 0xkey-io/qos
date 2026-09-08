@@ -95,12 +95,14 @@ async fn await_all(tasks: Vec<JoinHandle<Result<(), IOError>>>) {
 
 	for result in results {
 		match result {
-				Err(err) => eprintln!("error on task joining: {err:?}"),
-				Ok(result) => match result {
-					Ok(()) => println!("tcp to vsock bridge host exit, no errors. This shouldn't happen"),
-					Err(err) => eprintln!("error in task: {err:?}"),
-				},
-			}
+			Err(err) => eprintln!("error on task joining: {err:?}"),
+			Ok(result) => match result {
+				Ok(()) => println!(
+					"tcp to vsock bridge host exit, no errors. This shouldn't happen"
+				),
+				Err(err) => eprintln!("error in task: {err:?}"),
+			},
+		}
 	}
 }
 
@@ -136,6 +138,10 @@ async fn tcp_to_vsock(
 				);
 				return;
 			}
+
+			// see https://github.com/rust-vmm/vhost-device/issues/963
+			#[cfg(feature = "qemu")]
+			tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
 			if let Err(err) =
 				copy_bidirectional(&mut tcp_stream, &mut stream).await

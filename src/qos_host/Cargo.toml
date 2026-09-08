@@ -21,4 +21,5 @@ serde = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [features]
-vm = ["qos_core/vm"]
+# Support for localhost qemu setup without forcing host to use root
+qemu = ["qos_core/qemu"]

@@ -2,16 +2,17 @@
 //! Document.
 
 use aws_nitro_enclaves_cose::{
+	CoseSign1,
 	crypto::{Hash, MessageDigest, SignatureAlgorithm, SigningPublicKey},
 	error::CoseError,
-	CoseSign1,
 };
 use aws_nitro_enclaves_nsm_api::api::AttestationDoc;
 use p384::{
-	ecdsa::{signature::hazmat::PrehashVerifier, Signature, VerifyingKey},
 	PublicKey,
+	ecdsa::{Signature, VerifyingKey, signature::hazmat::PrehashVerifier},
 };
 use serde_bytes::ByteBuf;
+use sha2::{Digest as _, Sha384};
 
 mod error;
 mod syntactic_validation;
@@ -42,6 +43,250 @@ static AWS_NITRO_CERT_SIG_ALG: &[&webpki::SignatureAlgorithm] =
 pub const AWS_ROOT_CERT_PEM: &[u8] =
 	std::include_bytes!("./static/aws_root_cert.pem");
 
+/// PCR index QOS uses for the setup manifest/key commitment.
+pub const SETUP_MANIFEST_COMMITMENT_PCR_INDEX: u16 = 16;
+
+/// PCR index QOS uses for the live manifest/key commitment.
+pub const LIVE_MANIFEST_COMMITMENT_PCR_INDEX: u16 = 17;
+
+/// Current Nitro attestation documents allow PCR indexes 0 through 31.
+pub const ATTESTABLE_PCR_COUNT: u16 = 32;
+
+/// SHA384 PCR byte length.
+pub const PCR_SHA384_LEN: usize = 48;
+
+/// Release-pinned initial value for QOS manifest commitment PCRs.
+pub const MANIFEST_COMMITMENT_INITIAL_PCR: [u8; PCR_SHA384_LEN] =
+	[0u8; PCR_SHA384_LEN];
+
+const SETUP_MANIFEST_PCR_COMMITMENT_DOMAIN: &str =
+	"qos-setup-manifest-pcr-commitment-v1";
+const LIVE_MANIFEST_PCR_COMMITMENT_DOMAIN: &str =
+	"qos-live-manifest-pcr-commitment-v1";
+
+/// Which manifest/key PCR commitment a verifier expects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestCommitmentKind {
+	/// Setup/boot key commitment used for provisioning and key-forwarding.
+	Setup,
+	/// Live/app key commitment used after the quorum key is installed.
+	Live,
+}
+
+/// Expected values for manifest-backed attestation verification.
+#[derive(Debug, Clone, Copy)]
+pub struct ManifestAttestationInput<'a> {
+	/// Expected manifest hash.
+	pub manifest_hash: &'a [u8],
+	/// Expected PCR0.
+	pub pcr0: &'a [u8],
+	/// Expected PCR1.
+	pub pcr1: &'a [u8],
+	/// Expected PCR2.
+	pub pcr2: &'a [u8],
+	/// Expected PCR3.
+	pub pcr3: &'a [u8],
+}
+
+impl ManifestCommitmentKind {
+	/// PCR index for this commitment kind.
+	#[must_use]
+	pub const fn pcr_index(self) -> u16 {
+		match self {
+			Self::Setup => SETUP_MANIFEST_COMMITMENT_PCR_INDEX,
+			Self::Live => LIVE_MANIFEST_COMMITMENT_PCR_INDEX,
+		}
+	}
+
+	const fn domain(self) -> &'static str {
+		match self {
+			Self::Setup => SETUP_MANIFEST_PCR_COMMITMENT_DOMAIN,
+			Self::Live => LIVE_MANIFEST_PCR_COMMITMENT_DOMAIN,
+		}
+	}
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ManifestPcrCommitmentPreimage<'a> {
+	domain: &'static str,
+	#[serde(with = "qos_hex::serde")]
+	manifest_hash: &'a [u8],
+	#[serde(with = "qos_hex::serde")]
+	ephemeral_public_key: &'a [u8],
+}
+
+fn manifest_pcr_commitment_preimage(
+	kind: ManifestCommitmentKind,
+	manifest_hash: &[u8],
+	ephemeral_public_key: &[u8],
+) -> Vec<u8> {
+	qos_json::to_vec(&ManifestPcrCommitmentPreimage {
+		domain: kind.domain(),
+		manifest_hash,
+		ephemeral_public_key,
+	})
+	.expect("manifest PCR commitment preimage only contains strings")
+}
+
+/// Compute the domain-separated manifest PCR commitment input.
+#[must_use]
+pub fn manifest_pcr_commitment(
+	kind: ManifestCommitmentKind,
+	manifest_hash: &[u8],
+	ephemeral_public_key: &[u8],
+) -> [u8; PCR_SHA384_LEN] {
+	let preimage = manifest_pcr_commitment_preimage(
+		kind,
+		manifest_hash,
+		ephemeral_public_key,
+	);
+	let mut hasher = Sha384::new();
+	hasher.update(preimage);
+	hasher.finalize().into()
+}
+
+/// Compute the SHA384 PCR extension value.
+///
+/// Nitro PCR3/PCR4 documentation models PCR extension as hashing the
+/// 48-byte zero value followed by the measurement input, which corresponds to
+/// SHA384(current PCR || data).
+///
+/// # Errors
+///
+/// Returns [`AttestError::InvalidPcr`] if `current_pcr` is not a SHA384 PCR.
+pub fn pcr_extend_sha384(
+	current_pcr: &[u8],
+	data: &[u8],
+) -> Result<[u8; PCR_SHA384_LEN], AttestError> {
+	if current_pcr.len() != PCR_SHA384_LEN {
+		return Err(AttestError::InvalidPcr);
+	}
+
+	let mut hasher = Sha384::new();
+	hasher.update(current_pcr);
+	hasher.update(data);
+	Ok(hasher.finalize().into())
+}
+
+/// Compute the expected manifest commitment PCR value.
+///
+/// # Errors
+///
+/// Returns [`AttestError::InvalidPcr`] if the pinned initial PCR value is
+/// malformed.
+pub fn expected_manifest_commitment_pcr(
+	kind: ManifestCommitmentKind,
+	manifest_hash: &[u8],
+	ephemeral_public_key: &[u8],
+) -> Result<[u8; PCR_SHA384_LEN], AttestError> {
+	let commitment =
+		manifest_pcr_commitment(kind, manifest_hash, ephemeral_public_key);
+	pcr_extend_sha384(&MANIFEST_COMMITMENT_INITIAL_PCR, &commitment)
+}
+
+/// Verify QOS PCR state in an attestation document.
+///
+/// # Errors
+///
+/// Returns [`AttestError`] if validation fails.
+pub fn verify_attestation_doc_manifest_commitment(
+	attestation_doc: &AttestationDoc,
+	kind: ManifestCommitmentKind,
+	manifest_hash: &[u8],
+) -> Result<(), AttestError> {
+	for idx in 0..ATTESTABLE_PCR_COUNT {
+		if !attestation_doc.pcrs.contains_key(&usize::from(idx)) {
+			return Err(AttestError::MissingPcr { index: idx });
+		}
+	}
+
+	let public_key = attestation_doc
+		.public_key
+		.as_ref()
+		.ok_or(AttestError::MissingPubKey)?;
+	let expected = expected_manifest_commitment_pcr(
+		kind,
+		manifest_hash,
+		public_key.as_ref(),
+	)?;
+
+	let pcr_index = kind.pcr_index();
+	let actual = attestation_doc
+		.pcrs
+		.get(&usize::from(pcr_index))
+		.ok_or(AttestError::MissingPcr { index: pcr_index })?;
+
+	if actual.as_ref() != expected.as_slice() {
+		return Err(AttestError::DifferentPcr {
+			index: pcr_index,
+			expected: qos_hex::encode(&expected),
+			actual: qos_hex::encode(actual.as_ref()),
+		});
+	}
+
+	Ok(())
+}
+
+/// Verify a standard QOS attestation document.
+///
+/// # Errors
+///
+/// Returns [`AttestError`] if validation fails.
+pub fn verify_attestation_doc_against_manifest(
+	kind: ManifestCommitmentKind,
+	attestation_doc: &AttestationDoc,
+	expected: ManifestAttestationInput<'_>,
+) -> Result<(), AttestError> {
+	verify_attestation_doc_against_user_input(
+		attestation_doc,
+		expected.manifest_hash,
+		expected.pcr0,
+		expected.pcr1,
+		expected.pcr2,
+		expected.pcr3,
+	)?;
+	verify_attestation_doc_manifest_commitment(
+		attestation_doc,
+		kind,
+		expected.manifest_hash,
+	)?;
+
+	Ok(())
+}
+
+/// Verify a setup/boot QOS attestation document.
+///
+/// # Errors
+///
+/// Returns [`AttestError`] if validation fails.
+pub fn verify_attestation_doc_against_manifest_setup(
+	attestation_doc: &AttestationDoc,
+	expected: ManifestAttestationInput<'_>,
+) -> Result<(), AttestError> {
+	verify_attestation_doc_against_manifest(
+		ManifestCommitmentKind::Setup,
+		attestation_doc,
+		expected,
+	)
+}
+
+/// Verify a live/app QOS attestation document.
+///
+/// # Errors
+///
+/// Returns [`AttestError`] if validation fails.
+pub fn verify_attestation_doc_against_manifest_live(
+	attestation_doc: &AttestationDoc,
+	expected: ManifestAttestationInput<'_>,
+) -> Result<(), AttestError> {
+	verify_attestation_doc_against_manifest(
+		ManifestCommitmentKind::Live,
+		attestation_doc,
+		expected,
+	)
+}
+
 /// Extract a DER encoded certificate from bytes representing a PEM encoded
 /// certificate.
 ///
@@ -56,6 +301,9 @@ pub fn cert_from_pem(pem: &[u8]) -> Result<Vec<u8>, AttestError> {
 }
 
 /// Verify that `attestation_doc` matches the specified parameters.
+///
+/// This checks the legacy/user-supplied attestation fields and PCR0 through
+/// PCR3 only.
 ///
 /// To learn more about the attestation document fields see:
 /// <https://github.com/aws/aws-nitro-enclaves-nsm-api/blob/main/docs/attestation_process.md#22-attestation-document-specification/>.
@@ -185,7 +433,7 @@ pub fn unsafe_attestation_doc_from_der(
 }
 
 /// Extract the DER encoded `AttestationDoc` from the nitro secure module
-/// (nsm) provided COSE Sign1 structure. This function will verify the the
+/// (nsm) provided COSE Sign1 structure. This function will verify the
 /// root certificate authority via the CA bundle and verify that the end
 /// entity certificate signed the COSE Sign1 structure.
 ///
@@ -329,7 +577,7 @@ impl SigningPublicKey for P384PubKey {
 	}
 }
 
-struct Sha2;
+pub(crate) struct Sha2;
 impl Hash for Sha2 {
 	fn hash(digest: MessageDigest, data: &[u8]) -> Result<Vec<u8>, CoseError> {
 		use sha2::Digest as _;
@@ -343,10 +591,13 @@ impl Hash for Sha2 {
 
 #[cfg(test)]
 mod test {
+	use std::collections::BTreeMap;
+
 	use aws_nitro_enclaves_cose::{
 		crypto::SigningPrivateKey, header_map::HeaderMap,
 	};
-	use p384::{ecdsa::SigningKey, SecretKey};
+	use aws_nitro_enclaves_nsm_api::api::Digest;
+	use p384::{SecretKey, ecdsa::SigningKey};
 
 	use super::*;
 	use crate::mock::{
@@ -357,6 +608,37 @@ mod test {
 
 	// Public domain work: Pride and Prejudice by Jane Austen, taken from https://www.gutenberg.org/files/1342/1342.txt
 	const TEXT: &[u8] = b"It is a truth universally acknowledged, that a single man in possession of a good fortune, must be in want of a wife.";
+
+	fn manifest_commitment_attestation_doc(
+		kind: ManifestCommitmentKind,
+		manifest_hash: &[u8],
+		public_key: &[u8],
+	) -> AttestationDoc {
+		let expected_pcr =
+			expected_manifest_commitment_pcr(kind, manifest_hash, public_key)
+				.unwrap();
+
+		let mut pcrs = BTreeMap::new();
+		for idx in 0..ATTESTABLE_PCR_COUNT {
+			pcrs.insert(usize::from(idx), ByteBuf::from(vec![0u8; 48]));
+		}
+		pcrs.insert(
+			usize::from(kind.pcr_index()),
+			ByteBuf::from(expected_pcr.to_vec()),
+		);
+
+		AttestationDoc {
+			module_id: "test-module".into(),
+			digest: Digest::SHA384,
+			timestamp: 1,
+			pcrs,
+			certificate: ByteBuf::new(),
+			cabundle: vec![],
+			public_key: Some(ByteBuf::from(public_key.to_vec())),
+			user_data: Some(ByteBuf::from(manifest_hash.to_vec())),
+			nonce: None,
+		}
+	}
 
 	struct P384PrivateKey(p384::SecretKey);
 	impl SigningPrivateKey for P384PrivateKey {
@@ -406,6 +688,232 @@ mod test {
 	}
 
 	#[test]
+	fn manifest_pcr_commitment_preimage_uses_qos_json() {
+		let preimage = manifest_pcr_commitment_preimage(
+			ManifestCommitmentKind::Setup,
+			&[1, 2],
+			&[3, 4],
+		);
+
+		assert_eq!(
+			String::from_utf8(preimage).unwrap(),
+			r#"{"domain":"qos-setup-manifest-pcr-commitment-v1","ephemeralPublicKey":"0304","manifestHash":"0102"}"#
+		);
+	}
+
+	#[test]
+	fn pcr_extend_sha384_matches_aws_pcr3_example() {
+		let role_arn = b"arn:aws:iam::123456789012:role/Webserver";
+		let pcr = pcr_extend_sha384(&[0u8; 48], role_arn).unwrap();
+
+		assert_eq!(
+			qos_hex::encode(&pcr),
+			"78fce75db17cd4e0a3fb8dad3ad128ca5e77edbb2b2c7f75329dccd99aa5f6ef4fc1f1a452e315b9e98f9e312e6921e6"
+		);
+	}
+
+	#[test]
+	fn manifest_commitment_pcr_test_vectors() {
+		// Test vectors documented in docs/attestation_verification.md.
+		let manifest_hash = [1u8; 32];
+		let public_key = [3u8; 65];
+
+		let setup_commitment = manifest_pcr_commitment(
+			ManifestCommitmentKind::Setup,
+			&manifest_hash,
+			&public_key,
+		);
+		assert_eq!(
+			qos_hex::encode(&setup_commitment),
+			"e5997907ea1b7204c7a8890ae76d8d70b05f37d3bdda729d6b4c1febc55c7f3ecae51ce4746f136c07527c00b1298876"
+		);
+		let setup_pcr = expected_manifest_commitment_pcr(
+			ManifestCommitmentKind::Setup,
+			&manifest_hash,
+			&public_key,
+		)
+		.unwrap();
+		assert_eq!(
+			qos_hex::encode(&setup_pcr),
+			"f3e7209964e7d8f4915cc6038ec22d6dcdfcbea625b98f8a1a338e24407f122803f79be43ab65a4c4ad32a52b2c6ab4e"
+		);
+
+		let live_commitment = manifest_pcr_commitment(
+			ManifestCommitmentKind::Live,
+			&manifest_hash,
+			&public_key,
+		);
+		assert_eq!(
+			qos_hex::encode(&live_commitment),
+			"47a6e41fa6bbd0e9f46829dbcaf359829934b4fdbbcce099e508aab4127332c5812f385a4e9133ec3db812aa00be2b3f"
+		);
+		let live_pcr = expected_manifest_commitment_pcr(
+			ManifestCommitmentKind::Live,
+			&manifest_hash,
+			&public_key,
+		)
+		.unwrap();
+		assert_eq!(
+			qos_hex::encode(&live_pcr),
+			"afb56dbbe66008a5b6f190b81cf4e63603e15bf24bc6a93a135b82f8b1bb72ac4d3a0a191a20b3fd77e5b9333677b7fc"
+		);
+
+		assert_eq!(ManifestCommitmentKind::Setup.pcr_index(), 16);
+		assert_eq!(ManifestCommitmentKind::Live.pcr_index(), 17);
+		assert_eq!(MANIFEST_COMMITMENT_INITIAL_PCR, [0u8; 48]);
+	}
+
+	#[test]
+	fn verify_attestation_doc_manifest_commitment_works() {
+		let manifest_hash = [1u8; 32];
+		let public_key = [3u8; 65];
+		let attestation_doc = manifest_commitment_attestation_doc(
+			ManifestCommitmentKind::Setup,
+			&manifest_hash,
+			&public_key,
+		);
+
+		verify_attestation_doc_manifest_commitment(
+			&attestation_doc,
+			ManifestCommitmentKind::Setup,
+			&manifest_hash,
+		)
+		.unwrap();
+	}
+
+	#[test]
+	fn verify_attestation_doc_manifest_commitment_live_works() {
+		let manifest_hash = [1u8; 32];
+		let public_key = [3u8; 65];
+		let attestation_doc = manifest_commitment_attestation_doc(
+			ManifestCommitmentKind::Live,
+			&manifest_hash,
+			&public_key,
+		);
+
+		verify_attestation_doc_manifest_commitment(
+			&attestation_doc,
+			ManifestCommitmentKind::Live,
+			&manifest_hash,
+		)
+		.unwrap();
+	}
+
+	#[test]
+	fn verify_attestation_doc_manifest_commitment_rejects_wrong_kind() {
+		let manifest_hash = [1u8; 32];
+		let public_key = [3u8; 65];
+		let attestation_doc = manifest_commitment_attestation_doc(
+			ManifestCommitmentKind::Setup,
+			&manifest_hash,
+			&public_key,
+		);
+
+		let err = verify_attestation_doc_manifest_commitment(
+			&attestation_doc,
+			ManifestCommitmentKind::Live,
+			&manifest_hash,
+		)
+		.unwrap_err();
+
+		assert!(
+			matches!(err, AttestError::DifferentPcr { index, .. } if index == LIVE_MANIFEST_COMMITMENT_PCR_INDEX)
+		);
+	}
+
+	#[test]
+	fn verify_attestation_doc_manifest_commitment_rejects_live_as_setup() {
+		let manifest_hash = [1u8; 32];
+		let public_key = [3u8; 65];
+		let attestation_doc = manifest_commitment_attestation_doc(
+			ManifestCommitmentKind::Live,
+			&manifest_hash,
+			&public_key,
+		);
+
+		let err = verify_attestation_doc_manifest_commitment(
+			&attestation_doc,
+			ManifestCommitmentKind::Setup,
+			&manifest_hash,
+		)
+		.unwrap_err();
+
+		assert!(
+			matches!(err, AttestError::DifferentPcr { index, .. } if index == SETUP_MANIFEST_COMMITMENT_PCR_INDEX)
+		);
+	}
+
+	#[test]
+	fn verify_attestation_doc_against_manifest_rejects_bad_pcr2() {
+		let manifest_hash = [1u8; 32];
+		let public_key = [3u8; 65];
+		let attestation_doc = manifest_commitment_attestation_doc(
+			ManifestCommitmentKind::Setup,
+			&manifest_hash,
+			&public_key,
+		);
+
+		let err = verify_attestation_doc_against_manifest(
+			ManifestCommitmentKind::Setup,
+			&attestation_doc,
+			ManifestAttestationInput {
+				manifest_hash: &manifest_hash,
+				pcr0: &[0u8; PCR_SHA384_LEN],
+				pcr1: &[0u8; PCR_SHA384_LEN],
+				pcr2: &[9u8; PCR_SHA384_LEN],
+				pcr3: &[0u8; PCR_SHA384_LEN],
+			},
+		)
+		.unwrap_err();
+
+		assert!(matches!(err, AttestError::DifferentPcr2 { .. }));
+	}
+
+	#[test]
+	fn verify_attestation_doc_manifest_commitment_rejects_mismatched_key() {
+		let manifest_hash = [1u8; 32];
+		let public_key = [3u8; 65];
+		let mut attestation_doc = manifest_commitment_attestation_doc(
+			ManifestCommitmentKind::Setup,
+			&manifest_hash,
+			&public_key,
+		);
+		attestation_doc.public_key = Some(ByteBuf::from(vec![4u8; 65]));
+
+		let err = verify_attestation_doc_manifest_commitment(
+			&attestation_doc,
+			ManifestCommitmentKind::Setup,
+			&manifest_hash,
+		)
+		.unwrap_err();
+
+		assert!(
+			matches!(err, AttestError::DifferentPcr { index, .. } if index == SETUP_MANIFEST_COMMITMENT_PCR_INDEX)
+		);
+	}
+
+	#[test]
+	fn verify_attestation_doc_manifest_commitment_rejects_missing_range_pcr() {
+		let manifest_hash = [1u8; 32];
+		let public_key = [3u8; 65];
+		let mut attestation_doc = manifest_commitment_attestation_doc(
+			ManifestCommitmentKind::Setup,
+			&manifest_hash,
+			&public_key,
+		);
+		attestation_doc.pcrs.remove(&31);
+
+		let err = verify_attestation_doc_manifest_commitment(
+			&attestation_doc,
+			ManifestCommitmentKind::Setup,
+			&manifest_hash,
+		)
+		.unwrap_err();
+
+		assert!(matches!(err, AttestError::MissingPcr { index: 31 }));
+	}
+
+	#[test]
 	fn cose_sign1_ec384_validate() {
 		let (_, ec_public) = generate_p384();
 
@@ -452,24 +960,30 @@ mod test {
 			SecretKey::random(&mut p384::elliptic_curve::rand_core::OsRng);
 		let random_public = random_private.public_key();
 
-		assert!(cose_doc
-			.verify_signature::<Sha2>(&P384PubKey(random_public))
-			.is_err());
+		assert!(
+			cose_doc
+				.verify_signature::<Sha2>(&P384PubKey(random_public))
+				.is_err()
+		);
 
-		assert!(cose_doc
-			.get_payload::<Sha2>(Some(&P384PubKey(random_public)))
-			.is_err());
+		assert!(
+			cose_doc
+				.get_payload::<Sha2>(Some(&P384PubKey(random_public)))
+				.is_err()
+		);
 	}
 
 	#[test]
 	fn attestation_doc_from_der_works_with_valid_payload() {
 		let root_cert = cert_from_pem(AWS_ROOT_CERT_PEM).unwrap();
-		assert!(attestation_doc_from_der(
-			MOCK_NSM_ATTESTATION_DOCUMENT,
-			&root_cert[..],
-			MOCK_SECONDS_SINCE_EPOCH,
-		)
-		.is_ok());
+		assert!(
+			attestation_doc_from_der(
+				MOCK_NSM_ATTESTATION_DOCUMENT,
+				&root_cert[..],
+				MOCK_SECONDS_SINCE_EPOCH,
+			)
+			.is_ok()
+		);
 	}
 
 	#[test]
@@ -669,15 +1183,18 @@ mod test {
 			unsafe_attestation_doc_from_der(MOCK_NSM_ATTESTATION_DOCUMENT)
 				.unwrap();
 		// Accepts valid inputs
-		assert!(verify_attestation_doc_against_user_input(
-			&attestation_doc,
-			&qos_hex::decode(MOCK_USER_DATA_NSM_ATTESTATION_DOCUMENT).unwrap(),
-			&qos_hex::decode(MOCK_PCR0).unwrap(),
-			&qos_hex::decode(MOCK_PCR1).unwrap(),
-			&qos_hex::decode(MOCK_PCR2).unwrap(),
-			&qos_hex::decode(MOCK_PCR3).unwrap(),
-		)
-		.is_ok());
+		assert!(
+			verify_attestation_doc_against_user_input(
+				&attestation_doc,
+				&qos_hex::decode(MOCK_USER_DATA_NSM_ATTESTATION_DOCUMENT)
+					.unwrap(),
+				&qos_hex::decode(MOCK_PCR0).unwrap(),
+				&qos_hex::decode(MOCK_PCR1).unwrap(),
+				&qos_hex::decode(MOCK_PCR2).unwrap(),
+				&qos_hex::decode(MOCK_PCR3).unwrap(),
+			)
+			.is_ok()
+		);
 	}
 
 	#[test]

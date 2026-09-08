@@ -8,20 +8,28 @@ use qos_p256::{P256Pair, P256Public};
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::{
-	services::boot::QuorumMember, ProtocolError, ProtocolState, QosHash,
+	ProtocolError, ProtocolState, QosHash, services::boot::QuorumMember,
 };
 
 const QOS_TEST_MESSAGE: &[u8] = b"qos-test-message";
 
 /// Configuration for sharding a Quorum Key created in the Genesis flow.
 #[derive(
-	PartialEq, Debug, Eq, Clone, borsh::BorshSerialize, borsh::BorshDeserialize,
+	PartialEq,
+	Debug,
+	Eq,
+	Clone,
+	borsh::BorshSerialize,
+	borsh::BorshDeserialize,
+	serde::Serialize,
+	serde::Deserialize,
 )]
 pub struct GenesisSet {
 	/// Share Set Member's who's production key will be used to encrypt Genesis
 	/// flow outputs.
 	pub members: Vec<QuorumMember>,
 	/// Threshold for successful reconstitution of the Quorum Key shards
+	#[serde(with = "qos_json::string_or_numeric")]
 	pub threshold: u32,
 }
 
@@ -38,6 +46,7 @@ struct MemberShard {
 	member: QuorumMember,
 	/// Shard of the generated Quorum Key, encrypted to the `member`s Setup
 	/// Key.
+	#[serde(with = "qos_hex::serde")]
 	shard: Vec<u8>,
 }
 
@@ -110,34 +119,52 @@ impl fmt::Debug for GenesisMemberOutput {
 	Deserialize,
 )]
 pub struct GenesisOutput {
+	/// The exact [`GenesisSet`] from the boot genesis request this output was
+	/// generated for. Intentionally has no serde/borsh default so
+	/// pre-request-echo peers and outputs fail closed on decode.
+	pub set: GenesisSet,
+	/// The exact DR key from the boot genesis request, if one was provided.
+	#[serde(
+		default,
+		skip_serializing_if = "Option::is_none",
+		with = "qos_hex::serde::option"
+	)]
+	pub dr_key: Option<Vec<u8>>,
 	/// Public Quorum Key, DER encoded.
+	#[serde(with = "qos_hex::serde")]
 	pub quorum_key: Vec<u8>,
 	/// Quorum Member specific outputs from the genesis ceremony.
 	pub member_outputs: Vec<GenesisMemberOutput>,
 	/// All successfully `RecoveredPermutation`s completed during the genesis
 	/// process.
 	pub recovery_permutations: Vec<RecoveredPermutation>,
-	/// The threshold, K, used to generate the shards.
-	pub threshold: u32,
 	/// The quorum key encrypted to the DR key. None if no DR Key was provided
+	#[serde(
+		default,
+		skip_serializing_if = "Option::is_none",
+		with = "qos_hex::serde::option"
+	)]
 	pub dr_key_wrapped_quorum_key: Option<Vec<u8>>,
 	/// Hash of the quorum key secret
 	#[serde(with = "qos_hex::serde")]
 	pub quorum_key_hash: [u8; 64],
 	/// Test message encrypted to the quorum public key.
+	#[serde(with = "qos_hex::serde")]
 	pub test_message_ciphertext: Vec<u8>,
 	/// Signature over the test message by the quorum key.
+	#[serde(with = "qos_hex::serde")]
 	pub test_message_signature: Vec<u8>,
 	/// The message that was used to generate [`Self::test_message_signature`]
 	/// and [`Self::test_message_ciphertext`]
+	#[serde(with = "qos_hex::serde")]
 	pub test_message: Vec<u8>,
 }
 
 impl fmt::Debug for GenesisOutput {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.debug_struct("GenesisOutput")
+			.field("set", &self.set)
 			.field("quorum_key", &qos_hex::encode(&self.quorum_key))
-			.field("threshold", &self.threshold)
 			.field("member_outputs", &self.member_outputs)
 			.field("recovery_permutations", &self.recovery_permutations)
 			.finish_non_exhaustive()
@@ -151,6 +178,8 @@ pub(in crate::protocol) fn boot_genesis(
 	genesis_set: &GenesisSet,
 	maybe_dr_key: Option<Vec<u8>>,
 ) -> Result<(GenesisOutput, NsmResponse), ProtocolError> {
+	super::boot::ensure_unique_members(&genesis_set.members)?;
+
 	let quorum_pair = P256Pair::generate()?;
 	let master_seed = &quorum_pair.to_master_seed()[..];
 
@@ -165,29 +194,30 @@ pub(in crate::protocol) fn boot_genesis(
 		.map(|(share, share_set_member)| -> Result<GenesisMemberOutput, ProtocolError> {
 			// 1) encrypt the share to quorum key
 			let personal_pub = P256Public::from_bytes(&share_set_member.pub_key)?;
-			let encrypted_quorum_key_share = personal_pub.encrypt(&share)?;
+			let encrypted_quorum_key_share = personal_pub.encrypt(&share[..])?;
 
 			Ok(GenesisMemberOutput {
 				share_set_member,
 				encrypted_quorum_key_share,
-				share_hash: sha_512(&share),
+				share_hash: sha_512(&share[..]),
 			})
 		})
 		.collect();
 
-	let dr_key_wrapped_quorum_key = if let Some(dr_key) = maybe_dr_key {
-		let dr_public = P256Public::from_bytes(&dr_key)
+	let dr_key_wrapped_quorum_key = if let Some(dr_key) = &maybe_dr_key {
+		let dr_public = P256Public::from_bytes(dr_key)
 			.map_err(ProtocolError::InvalidP256DRKey)?;
 		Some(dr_public.encrypt(master_seed)?)
 	} else {
 		None
 	};
 
-	let hex_master_seed = qos_hex::encode(master_seed);
+	let hex_master_seed = zeroize::Zeroizing::new(qos_hex::encode(master_seed));
 	let genesis_output = GenesisOutput {
+		set: genesis_set.clone(),
+		dr_key: maybe_dr_key,
 		member_outputs: member_outputs?,
 		quorum_key: quorum_pair.public_key().to_bytes(),
-		threshold: genesis_set.threshold,
 		// TODO: generate N choose K recovery permutations
 		recovery_permutations: vec![],
 		dr_key_wrapped_quorum_key,
@@ -228,7 +258,7 @@ mod test {
 			"PIV".to_string(),
 		);
 		let mut protocol_state =
-			ProtocolState::new(Box::new(MockNsm), handles.clone(), None);
+			ProtocolState::new(Box::new(MockNsm::new()), handles.clone(), None);
 		let member1_pair = P256Pair::generate().unwrap();
 		let member2_pair = P256Pair::generate().unwrap();
 		let member3_pair = P256Pair::generate().unwrap();
@@ -256,24 +286,26 @@ mod test {
 		let (output, _nsm_response) =
 			boot_genesis(&mut protocol_state, &genesis_set, None).unwrap();
 		let zipped = std::iter::zip(output.member_outputs, member_pairs);
-		let shares: Vec<Vec<u8>> = zipped
+		let shares: Vec<zeroize::Zeroizing<Vec<u8>>> = zipped
 			.map(|(output, pair)| {
 				let decrypted_share =
-					&pair.decrypt(&output.encrypted_quorum_key_share).unwrap();
+					pair.decrypt(&output.encrypted_quorum_key_share).unwrap();
 
-				assert_eq!(sha_512(decrypted_share), output.share_hash);
+				assert_eq!(sha_512(&decrypted_share[..]), output.share_hash);
 
-				decrypted_share.clone()
+				decrypted_share
 			})
 			.collect();
 
-		let reconstructed: [u8; MASTER_SEED_LEN] =
-			qos_crypto::shamir::shares_reconstruct(
-				&shares[0..threshold as usize],
-			)
-			.unwrap()
-			.try_into()
-			.unwrap();
+		let reconstructed: zeroize::Zeroizing<[u8; MASTER_SEED_LEN]> =
+			zeroize::Zeroizing::new(
+				qos_crypto::shamir::shares_reconstruct(
+					&shares[0..threshold as usize],
+				)
+				.unwrap()[..]
+					.try_into()
+					.unwrap(),
+			);
 		let reconstructed_quorum_key =
 			P256Pair::from_master_seed(&reconstructed).unwrap();
 
@@ -292,13 +324,90 @@ mod test {
 		let test_message_plaintext = reconstructed_quorum_key
 			.decrypt(&output.test_message_ciphertext)
 			.unwrap();
-		assert_eq!(test_message_plaintext, QOS_TEST_MESSAGE);
+		assert_eq!(&test_message_plaintext[..], QOS_TEST_MESSAGE);
 		quorum_public_key
 			.verify(QOS_TEST_MESSAGE, &output.test_message_signature)
 			.unwrap();
 
 		let quorum_key_hash =
-			sha_512(qos_hex::encode(&reconstructed).as_bytes());
+			sha_512(qos_hex::encode(&reconstructed[..]).as_bytes());
 		assert_eq!(quorum_key_hash, output.quorum_key_hash);
+	}
+
+	#[test]
+	fn boot_genesis_rejects_duplicate_members() {
+		let handles = Handles::new(
+			"EPH2".to_string(),
+			"QUO2".to_string(),
+			"MAN2".to_string(),
+			"PIV2".to_string(),
+		);
+		let mut protocol_state =
+			ProtocolState::new(Box::new(MockNsm::new()), handles, None);
+		let member_pair = P256Pair::generate().unwrap();
+
+		// The same public key under two different aliases must be rejected.
+		let genesis_set = GenesisSet {
+			members: vec![
+				QuorumMember {
+					alias: "alias-a".to_string(),
+					pub_key: member_pair.public_key().to_bytes(),
+				},
+				QuorumMember {
+					alias: "alias-b".to_string(),
+					pub_key: member_pair.public_key().to_bytes(),
+				},
+			],
+			threshold: 2,
+		};
+
+		let err =
+			boot_genesis(&mut protocol_state, &genesis_set, None).unwrap_err();
+		assert_eq!(err, ProtocolError::DuplicateQuorumMember);
+	}
+
+	#[test]
+	fn rejects_modified_boot_genesis_request() {
+		let handles = Handles::new(
+			"EPH".to_string(),
+			"QUO".to_string(),
+			"MAN".to_string(),
+			"PIV".to_string(),
+		);
+		let mut protocol_state =
+			ProtocolState::new(Box::new(MockNsm::new()), handles, None);
+
+		let members = (1..=3)
+			.map(|i| QuorumMember {
+				alias: format!("member{i}"),
+				pub_key: P256Pair::generate().unwrap().public_key().to_bytes(),
+			})
+			.collect();
+		let genesis_set = GenesisSet { members, threshold: 2 };
+		let dr_key = P256Pair::generate().unwrap().public_key().to_bytes();
+
+		let (output, _) = boot_genesis(
+			&mut protocol_state,
+			&genesis_set,
+			Some(dr_key.clone()),
+		)
+		.unwrap();
+		assert_eq!(output.set, genesis_set);
+		assert_eq!(output.dr_key, Some(dr_key));
+
+		// The echoed request is part of the attested-to output hash, so
+		// tampering with it is detectable.
+		let mut tampered = output.clone();
+		tampered.set.threshold = 1;
+		assert_ne!(tampered.qos_hash(), output.qos_hash());
+
+		let mut tampered = output.clone();
+		tampered.dr_key = None;
+		assert_ne!(tampered.qos_hash(), output.qos_hash());
+
+		let (output, _) =
+			boot_genesis(&mut protocol_state, &genesis_set, None).unwrap();
+		assert_eq!(output.set, genesis_set);
+		assert_eq!(output.dr_key, None);
 	}
 }

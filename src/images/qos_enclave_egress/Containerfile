@@ -1,0 +1,103 @@
+FROM stagex/eif_build:0.2.2@sha256:9d086a2743f9df4eddf934c7b68c9dee4a7fb131b6465a24237a67f6c359dfb0 AS eif_build
+FROM stagex/gen_initramfs:6.8@sha256:f5b9271cca6003e952cbbb9ef041ffa92ba328894f563d1d77942e6b5cdeac1a AS gen_initramfs
+FROM stagex/linux-nitro:sx2024.03.0@sha256:073c4603686e3bdc0ed6755fee3203f6f6f1512e0ded09eaea8866b002b04264 AS linux-nitro
+FROM stagex/core-gcc:15.2.0@sha256:ceae6035d43fe3653e142e638fd78d72950cd51e7a5dba4755d1db081c54de77 AS gcc
+FROM stagex/core-libunwind:1.7.2@sha256:eb66122d8fc543f5e2f335bb1616f8c3a471604383e2c0a9df4a8e278505d3bc AS libunwind
+FROM stagex/iproute2:sx2024.11.0@sha256:65da03aa94d17dd6310b022f426a6cc8b3c55bb267e4bac1697bc57d6c850570 AS iproute2
+FROM stagex/musl:sx2024.11.0@sha256:d7f6c365f5724c65cadb2b96d9f594e46132ceb366174c89dbf7554897f2bc53 AS musl
+
+FROM common AS base
+
+RUN mkdir -p /qos
+ADD . /qos
+
+# pre-fetch all QOS deps
+RUN cd /qos && cargo fetch
+
+# pre-fetch all QOS deps even for crates excluded from the workspace
+# these dependencies are needed when building qos_enclave
+RUN cd /qos/src/init && cargo fetch
+RUN cd /qos/src/qos_enclave && cargo fetch
+
+FROM base AS build-qos_enclave
+WORKDIR /qos/src/qos_enclave
+RUN --network=none cargo build ${CARGOFLAGS}
+RUN cp target/x86_64-unknown-linux-musl/release/qos_enclave /
+RUN file /qos_enclave | grep "static-pie"
+
+FROM base AS build-init
+WORKDIR /qos/src/init
+RUN --network=none cargo build --features egress ${CARGOFLAGS}
+RUN cp target/x86_64-unknown-linux-musl/release/init /
+RUN file /init | grep "static-pie"
+
+FROM base AS build-egress
+ENV CARGOFLAGS="--locked --no-default-features --profile release-panic-abort --target ${TARGET}"
+WORKDIR /qos/src/qos_bridge
+RUN --network=none cargo build --features egress ${CARGOFLAGS} --bin egress
+RUN cp ../../target/x86_64-unknown-linux-musl/release-panic-abort/egress /egress
+RUN file /egress | grep "static-pie"
+
+FROM base AS build-eif
+WORKDIR /build_cpio
+COPY --from=eif_build . /
+COPY --from=gcc . /
+COPY --from=libunwind . /
+COPY --from=gen_initramfs . /
+COPY --from=build-init /init .
+COPY --from=linux-nitro /nsm.ko .
+COPY --from=iproute2 . /
+COPY --from=musl . /
+COPY --from=build-egress /egress .
+COPY <<-EOF initramfs.list
+	file /init     init    0755 0 0
+	file /nsm.ko   nsm.ko  0755 0 0
+	dir  /run              0755 0 0
+	dir  /tmp              0755 0 0
+	dir  /etc              0755 0 0
+	dir  /bin              0755 0 0
+	dir  /sbin             0755 0 0
+	dir  /proc             0755 0 0
+	dir  /sys              0755 0 0
+	dir  /usr              0755 0 0
+	dir  /lib              0755 0 0
+	dir  /usr/bin          0755 0 0
+	dir  /usr/sbin         0755 0 0
+	dir  /usr/lib          0755 0 0
+	dir  /dev              0755 0 0
+	dir  /dev/shm          0755 0 0
+	dir  /dev/pts          0755 0 0
+	nod  /dev/console      0600 0 0 c 5 1
+	file /egress           egress           0700 0 0
+	file /usr/sbin/ip      /usr/sbin/ip     0700 0 0
+	file /lib/ld-musl-x86  /usr/lib/ld-musl-x86_64.so.1                   0700 0 0
+EOF
+ENV CPIO_TIMESTAMP=1
+ENV KBUILD_BUILD_TIMESTAMP=1
+RUN <<-EOF
+	find . -exec touch -hcd "@0" "{}" +
+	mkdir /build_eif
+	gen_init_cpio -t 1 initramfs.list > /build_eif/rootfs.cpio
+	touch -hcd "@0" rootfs.cpio
+EOF
+WORKDIR /build_eif
+COPY --from=linux-nitro /bzImage .
+COPY --from=linux-nitro /linux.config .
+RUN eif_build \
+	--ramdisk rootfs.cpio \
+	--kernel bzImage \
+	--kernel_config linux.config \
+	--pcrs_output /nitro.pcrs \
+	--output /nitro.eif \
+	--cmdline 'reboot=k initrd=0x2000000,3228672 root=/dev/ram0 panic=1 pci=off nomodules console=ttyS0 i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd'
+
+FROM scratch AS package
+COPY --from=build-eif /nitro.eif .
+COPY --from=build-eif /nitro.pcrs .
+COPY --from=build-qos_enclave /qos_enclave .
+COPY src/qos_enclave/LICENSES/Apache-2.0.txt /licenses/Apache-2.0.txt
+COPY src/qos_enclave/NOTICE /licenses/qos_enclave-NOTICE
+ENTRYPOINT ["/qos_enclave"]
+ENV EIF_PATH=/nitro.eif
+ENV ENCLAVE_NAME=qos
+EXPOSE 8080

@@ -1,4 +1,4 @@
-//! Primitive types for test setup.
+#![doc = include_str!("../README.md")]
 
 use std::{
 	net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream},
@@ -101,7 +101,7 @@ pub fn find_free_port() -> Option<u16> {
 	for _ in 0..MAX_FIND_FREE_PORT_ATTEMPTS {
 		match TcpListener::bind(("127.0.0.1", 0)) {
 			Ok(listener) => {
-				return listener.local_addr().ok().map(|addr| addr.port())
+				return listener.local_addr().ok().map(|addr| addr.port());
 			}
 			Err(err) => {
 				last_err = Some(err);
@@ -122,7 +122,7 @@ pub fn find_free_port() -> Option<u16> {
 ///
 /// # Panics
 ///
-/// Panics if the the port is not bound to within `MAX_PORT_BIND_WAIT_TIME`.
+/// Panics if the port is not bound to within `MAX_PORT_BIND_WAIT_TIME`.
 pub fn wait_until_port_is_bound(port: u16) {
 	let mut wait_time = PORT_BIND_WAIT_TIME_INCREMENT;
 

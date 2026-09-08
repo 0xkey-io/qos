@@ -1,7 +1,7 @@
 [package]
 name = "init"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 rust-version = "1.88"
 publish = false
 
@@ -10,10 +10,14 @@ libc = "=0.2.174"
 nix = { version = "0.30.1", features = ["ioctl"]}
 qos_aws = { path = "../qos_aws"}
 qos_system = { path = "../qos_system"}
-qos_core = { path = "../qos_core", features = ["vm"], default-features = false }
+qos_core = { path = "../qos_core", default-features = false }
 qos_nsm = { path = "../qos_nsm", default-features = false }
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"], default-features = false }
 
 [[bin]]
 name = "init"
 path = "init.rs"
+
+[features]
+# Support for egress
+egress = ["qos_core/egress"]

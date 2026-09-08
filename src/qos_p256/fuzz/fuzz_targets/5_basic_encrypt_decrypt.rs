@@ -16,7 +16,9 @@ fuzz_target!(|input: FuzzKeyDataStruct| {
 	// let the fuzzer control a message plaintext that is encrypted and then decrypted again
 
 	// private key generation is non-deterministic: not ideal
-	let key_pair = match P256EncryptPair::from_bytes(&input.key) {
+	let key_pair = match P256EncryptPair::from_bytes(&zeroize::Zeroizing::new(
+		input.key.to_vec(),
+	)) {
 		Ok(pair) => pair,
 		Err(_err) => {
 			return;
@@ -34,5 +36,5 @@ fuzz_target!(|input: FuzzKeyDataStruct| {
 	let decrypted_data = key_pair.decrypt(&serialized_envelope).unwrap();
 
 	// check roundtrip data consistency, assert should always hold
-	assert_eq!(decrypted_data, data);
+	assert_eq!(&decrypted_data[..], data);
 });

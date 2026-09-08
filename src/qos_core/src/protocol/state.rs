@@ -1,5 +1,6 @@
 //! Quorum protocol state machine
 use qos_nsm::NsmProvider;
+use qos_p256::P256Pair;
 
 use super::{
 	error::ProtocolError, msg::ProtocolMsg, services::provision::SecretBuilder,
@@ -19,17 +20,34 @@ use crate::handles::Handles;
 	serde::Deserialize,
 )]
 pub enum ProtocolPhase {
+	// Keep legacy PascalCase wire values for backward compatibility with
+	// existing clients, while accepting camelCase aliases during decode.
 	/// The state machine cannot recover. The enclave must be rebooted.
+	#[serde(rename = "UnrecoverableError", alias = "unrecoverableError")]
 	UnrecoverableError,
 	/// Waiting to receive a boot instruction.
+	#[serde(
+		rename = "WaitingForBootInstruction",
+		alias = "waitingForBootInstruction"
+	)]
 	WaitingForBootInstruction,
 	/// Genesis service has been booted. No further actions.
+	#[serde(rename = "GenesisBooted", alias = "genesisBooted")]
 	GenesisBooted,
 	/// Waiting to receive K quorum shards
+	#[serde(
+		rename = "WaitingForQuorumShards",
+		alias = "waitingForQuorumShards"
+	)]
 	WaitingForQuorumShards,
 	/// The enclave has successfully provisioned its quorum key.
+	#[serde(rename = "QuorumKeyProvisioned", alias = "quorumKeyProvisioned")]
 	QuorumKeyProvisioned,
 	/// Waiting for a forwarded key to be injected
+	#[serde(
+		rename = "WaitingForForwardedKey",
+		alias = "waitingForForwardedKey"
+	)]
 	WaitingForForwardedKey,
 }
 
@@ -54,10 +72,9 @@ impl ProtocolRoute {
 
 		// ignore transitions in special cases
 		if let Some(Ok(ProtocolMsg::ProvisionResponse { reconstructed })) = resp
+			&& !reconstructed
 		{
-			if !reconstructed {
-				return resp;
-			}
+			return resp;
 		}
 
 		// handle state transitions
@@ -69,10 +86,10 @@ impl ProtocolRoute {
 			},
 		};
 
-		if let Some(phase) = transition {
-			if let Err(e) = state.transition(phase) {
-				return Some(Err(ProtocolMsg::ProtocolErrorResponse(e)));
-			}
+		if let Some(phase) = transition
+			&& let Err(e) = state.transition(phase)
+		{
+			return Some(Err(ProtocolMsg::ProtocolErrorResponse(e)));
 		}
 
 		resp
@@ -172,6 +189,7 @@ pub(crate) struct ProtocolState {
 	pub provisioner: SecretBuilder,
 	pub attestor: Box<dyn NsmProvider>,
 	pub handles: Handles,
+	pending_live_ephemeral_key: Option<P256Pair>,
 	phase: ProtocolPhase,
 }
 
@@ -192,30 +210,48 @@ impl ProtocolState {
 		#[cfg(not(any(feature = "mock", test)))]
 		let init_phase = ProtocolPhase::WaitingForBootInstruction;
 
-		Self { attestor, provisioner, phase: init_phase, handles }
+		Self {
+			attestor,
+			provisioner,
+			pending_live_ephemeral_key: None,
+			phase: init_phase,
+			handles,
+		}
 	}
 
 	pub fn get_phase(&self) -> ProtocolPhase {
 		self.phase
 	}
 
-	pub fn handle_msg(&mut self, msg_req: &ProtocolMsg) -> Vec<u8> {
+	pub(crate) fn set_pending_live_ephemeral_key(&mut self, key: P256Pair) {
+		self.pending_live_ephemeral_key = Some(key);
+	}
+
+	pub(crate) fn take_pending_live_ephemeral_key(
+		&mut self,
+	) -> Result<P256Pair, ProtocolError> {
+		self.pending_live_ephemeral_key
+			.take()
+			.ok_or(ProtocolError::MissingLiveEphemeralKey)
+	}
+
+	pub fn handle_msg_response(
+		&mut self,
+		msg_req: &ProtocolMsg,
+	) -> ProtocolMsg {
 		for route in &self.routes() {
 			match route.try_msg(msg_req, self) {
 				None => (),
 				Some(result) => match result {
 					Ok(msg_resp) | Err(msg_resp) => {
-						return borsh::to_vec(&msg_resp).expect(
-							"ProtocolMsg can always be serialized. qed.",
-						)
+						return msg_resp;
 					}
 				},
 			}
 		}
 
 		let err = ProtocolError::NoMatchingRoute(self.phase);
-		borsh::to_vec(&ProtocolMsg::ProtocolErrorResponse(err))
-			.expect("ProtocolMsg can always be serialized. qed.")
+		ProtocolMsg::ProtocolErrorResponse(err)
 	}
 
 	#[allow(clippy::too_many_lines)]
@@ -333,11 +369,11 @@ impl ProtocolState {
 mod handlers {
 	use super::ProtocolRouteResponse;
 	use crate::protocol::{
+		ProtocolState,
 		msg::ProtocolMsg,
 		services::{
 			attestation, boot, genesis, key, key::EncryptedQuorumKey, provision,
 		},
-		ProtocolState,
 	};
 
 	// TODO: Add tests for this in the middle of some integration tests
@@ -407,19 +443,24 @@ mod handlers {
 		req: &ProtocolMsg,
 		state: &mut ProtocolState,
 	) -> ProtocolRouteResponse {
-		if let ProtocolMsg::BootStandardRequest { manifest_envelope, pivot } =
-			req
-		{
-			let result = boot::boot_standard(state, manifest_envelope, pivot)
-				.map(|nsm_response| ProtocolMsg::BootStandardResponse {
-					nsm_response,
-				})
-				.map_err(ProtocolMsg::ProtocolErrorResponse);
+		let (manifest_envelope, pivot) = match req {
+			ProtocolMsg::BootStandardRequest { manifest_envelope, pivot } => {
+				((**manifest_envelope).clone(), pivot)
+			}
+			ProtocolMsg::BootStandardJsonEnvelopeRequest {
+				manifest_envelope,
+				pivot,
+			} => (manifest_envelope.as_ref().clone().into_inner(), pivot),
+			_ => return None,
+		};
 
-			Some(result)
-		} else {
-			None
-		}
+		let result = boot::boot_standard(state, manifest_envelope, pivot)
+			.map(|nsm_response| ProtocolMsg::BootStandardResponse {
+				nsm_response,
+			})
+			.map_err(ProtocolMsg::ProtocolErrorResponse);
+
+		Some(result)
 	}
 
 	pub(super) fn boot_genesis(

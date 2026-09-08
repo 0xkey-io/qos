@@ -5,7 +5,8 @@
 //! The pivot is an executable the enclave runs to initialize the secure
 //! applications.
 use std::{
-	net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+	fs,
+	net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
 	process::Stdio,
 	sync::{Arc, RwLock},
 	time::Duration,
@@ -21,9 +22,9 @@ use crate::{
 	handles::Handles,
 	io::{HostBridge, IOError, SocketAddress, StreamPool},
 	protocol::{
-		processor::ProtocolProcessor,
-		services::boot::{BridgeConfig, PivotConfig, RestartPolicy},
 		ProtocolPhase, ProtocolState,
+		processor::ProtocolProcessor,
+		services::boot::{BridgeConfig, RestartPolicy},
 	},
 	server::SocketServer,
 };
@@ -35,6 +36,7 @@ pub const REAPER_RESTART_DELAY: Duration = Duration::from_millis(50);
 pub const REAPER_EXIT_DELAY: Duration = Duration::from_secs(3);
 
 const REAPER_STATE_CHECK_DELAY: Duration = Duration::from_millis(100);
+const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
 
 // runs the enclave vsock setup server for qos_host communication, waiting for manifest/pivot
 // executed as a task from `Reaper::execute`
@@ -66,18 +68,21 @@ async fn run_server(
 	println!("Reaper::server shutdown");
 }
 
-// runs the VSOCK -> TCP bridge so that apps can use any TCP based protocol without worrying about VSOCK
+// runs configured bridges based on `BridgeConfig` so that apps can use any TCP based protocol without worrying about VSOCK
 // communication. This is started if `PivotConfig::bridge_config` has any members defined.
-// uses the enclave core socket and given pivot host port to constuct the VSOCK to TCP bridge.
-fn run_vsock_to_tcp_bridge(
+// uses the enclave core socket and given pivot host port to construct the VSOCK to TCP bridge for server side
+// and opens a fully transparent egress if client side is set.
+fn run_bridges(
 	core_socket: &SocketAddress,
-	bridges: &Vec<BridgeConfig>,
+	bridges: &[BridgeConfig],
 ) -> Result<(), IOError> {
 	// do nothing if we're not asked to provide bridging
 	if bridges.is_empty() {
 		println!("skipping host bridge, not configured");
 		return Ok(());
 	}
+
+	let mut egress_enabled = false;
 
 	for bc in bridges {
 		match bc {
@@ -91,12 +96,33 @@ fn run_vsock_to_tcp_bridge(
 				bridge.vsock_to_tcp();
 			}
 			BridgeConfig::Client { port: _, host: _ } => {
-				panic!("client bridge unimplemented")
-			} // TODO: implement
+				// only run one instance as it covers ALL ports, the others are for firewalls
+				if !egress_enabled {
+					egress_enabled = true;
+					run_egress_bridge(core_socket);
+				}
+			}
 		}
 	}
 
 	Ok(())
+}
+
+// dummy placeholder
+#[cfg(not(feature = "egress"))]
+fn run_egress_bridge(_core_socket: &SocketAddress) {
+	panic!("unable to run egress without vsock support");
+}
+
+// run the transparent host egress
+#[cfg(feature = "egress")]
+fn run_egress_bridge(core_socket: &SocketAddress) {
+	let cid = core_socket.vsock().cid();
+
+	crate::egress::run_looping(
+		"/egress",
+		&format!("--cid {cid} --vsock-to-host false"),
+	);
 }
 
 fn reprint_pivot_output(child: &mut Child) {
@@ -129,6 +155,20 @@ fn reprint_pivot_output(child: &mut Child) {
 			}
 		}
 	});
+}
+
+fn resolv_conf_with_nameservers(resolvers: &[IpAddr]) -> String {
+	let mut output = String::new();
+	for resolver in resolvers {
+		output.push_str("nameserver ");
+		output.push_str(&resolver.to_string());
+		output.push('\n');
+	}
+	output
+}
+
+fn write_resolv_conf(resolvers: &[IpAddr]) -> std::io::Result<()> {
+	fs::write(RESOLV_CONF_PATH, resolv_conf_with_nameservers(resolvers))
 }
 
 /// Primary entry point for running the enclave. Coordinates spawning the server
@@ -188,24 +228,36 @@ impl Reaper {
 		let manifest = handles
 			.get_manifest_envelope()
 			.expect("Checked above that the manifest exists.")
-			.manifest;
-		let PivotConfig { args, restart, bridge_config: host_config, .. } =
-			manifest.pivot;
+			.manifest();
+		let args = manifest.args().to_vec();
+		let restart = manifest.restart();
+		let host_config = manifest.bridge_config().to_vec();
+		let dns_config = manifest.dns_config().cloned();
+
+		if let Some(dns_config) = dns_config {
+			write_resolv_conf(&dns_config.resolvers)
+				.expect("failed to write /etc/resolv.conf");
+		}
 
 		// if the app indicates the need for the VSOCK -> TCP bridge, run it as another task
-		run_vsock_to_tcp_bridge(&core_socket, &host_config)
-			.expect("failed to run VSOCK -> TCP socket bridge");
+		run_bridges(&core_socket, &host_config)
+			.expect("failed to run ingress/egress bridges");
 
 		let mut pivot = Command::new(handles.pivot_path());
 		pivot.env_clear();
 		pivot.args(&args[..]);
-		pivot.stdout(Stdio::piped()).stderr(Stdio::piped());
+		// Only pipe pivot output when it will be drained below.
+		if manifest.debug_mode() {
+			pivot.stdout(Stdio::piped()).stderr(Stdio::piped());
+		} else {
+			pivot.stdout(Stdio::null()).stderr(Stdio::null());
+		}
 
 		loop {
 			let mut child = pivot.spawn().expect("Failed to spawn pivot");
 			// print pivot stderr and stdout if in debug mode
 			// *NOTE*: this requires `DEBUG` and `LOGS` env vars set when booting the enclave itself. If not, nothing will be visible
-			if manifest.pivot.debug_mode {
+			if manifest.debug_mode() {
 				reprint_pivot_output(&mut child);
 			}
 
@@ -243,6 +295,29 @@ enum InterState {
 	Booting,
 	// We're quitting (ctrl+c for tests and such)
 	Quitting,
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn resolv_conf_write_uses_configured_nameservers() {
+		let resolvers = ["1.1.1.1", "2606:4700:4700::1111"]
+			.into_iter()
+			.map(|resolver| resolver.parse().unwrap())
+			.collect::<Vec<IpAddr>>();
+
+		assert_eq!(
+			resolv_conf_with_nameservers(&resolvers),
+			"nameserver 1.1.1.1\nnameserver 2606:4700:4700::1111\n"
+		);
+	}
+
+	#[test]
+	fn resolv_conf_write_supports_empty_resolver_list() {
+		assert_eq!(resolv_conf_with_nameservers(&[]), "");
+	}
 }
 
 // See qos_test/tests/async_reaper for more tests

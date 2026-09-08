@@ -2,16 +2,13 @@
 
 use aws_nitro_enclaves_nsm_api::api::AttestationDoc;
 use borsh::{BorshDeserialize, BorshSerialize};
-use qos_nsm::{
-	nitro::{attestation_doc_from_der, cert_from_pem, AWS_ROOT_CERT_PEM},
-	types::NsmResponse,
-};
+use qos_nsm::{nitro::attestation_doc_from_der, types::NsmResponse};
 use qos_p256::{P256Pair, P256Public};
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::{
-	services::boot::{put_manifest_and_pivot, ManifestEnvelope},
 	ProtocolError, ProtocolState, QosHash,
+	services::boot::{VersionedManifestEnvelope, put_manifest_and_pivot},
 };
 
 /// An encrypted quorum key along with a signature over the encrypted payload
@@ -19,8 +16,10 @@ use crate::protocol::{
 #[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize)]
 pub struct EncryptedQuorumKey {
 	/// The encrypted payload: a quorum key
+	#[serde(with = "qos_hex::serde")]
 	pub encrypted_quorum_key: Vec<u8>,
 	/// Signature over the encrypted quorum key
+	#[serde(with = "qos_hex::serde")]
 	pub signature: Vec<u8>,
 }
 
@@ -29,24 +28,28 @@ pub(in crate::protocol) fn inject_key(
 	EncryptedQuorumKey { encrypted_quorum_key, signature }: EncryptedQuorumKey,
 ) -> Result<(), ProtocolError> {
 	let manifest_envelope = state.handles.get_manifest_envelope()?;
+	let manifest = manifest_envelope.manifest();
 
 	// 1. Verify the signature over the `encrypted_quorum_key` against the
 	// Quorum Key specified in the New Manifest.
-	let quorum_public = P256Public::from_bytes(
-		&manifest_envelope.manifest.namespace.quorum_key,
-	)?;
+	let quorum_public =
+		P256Public::from_bytes(&manifest.namespace().quorum_key)?;
 	quorum_public
 		.verify(&encrypted_quorum_key, &signature)
 		.map_err(|_| ProtocolError::InvalidEncryptedQuorumKeySignature)?;
 
 	// 2. Decrypt the encrypted Quorum Key in the request with the Ephemeral
 	// Key.
-	let quorum_master_seed = {
+	let quorum_master_seed: zeroize::Zeroizing<
+		[u8; qos_p256::MASTER_SEED_LEN],
+	> = {
 		let ephemeral_pair = state.handles.get_ephemeral_key()?;
 		let bytes = ephemeral_pair.decrypt(&encrypted_quorum_key)?;
-		bytes
-			.try_into()
-			.map_err(|_| ProtocolError::EncryptedQuorumKeyInvalidLen)?
+		zeroize::Zeroizing::new(
+			bytes[..]
+				.try_into()
+				.map_err(|_| ProtocolError::EncryptedQuorumKeyInvalidLen)?,
+		)
 	};
 
 	// 3. Check that the decrypted Quorum Key public key matches the one
@@ -60,8 +63,8 @@ pub(in crate::protocol) fn inject_key(
 	// 4. Rotate the ephemeral key so it's safe for apps to use it independently
 	// of boot-related operations, which use the pre-boot ephemeral key as
 	// an encryption target (key-forward boot encrypts the quorum key to it)
-	let new_ephemeral_key = P256Pair::generate()?;
-	state.handles.rotate_ephemeral_key(&new_ephemeral_key)?;
+	let live_ephemeral_key = state.take_pending_live_ephemeral_key()?;
+	state.handles.rotate_ephemeral_key(&live_ephemeral_key)?;
 
 	// 5. Write the Quorum Key to the file system, at which point New Node will
 	// automatically pivot to running the Pivot App.
@@ -73,18 +76,21 @@ pub(in crate::protocol) fn inject_key(
 
 pub(in crate::protocol) fn boot_key_forward(
 	state: &mut ProtocolState,
-	manifest_envelope: &ManifestEnvelope,
+	manifest_envelope: impl Into<VersionedManifestEnvelope>,
 	pivot: &[u8],
 ) -> Result<NsmResponse, ProtocolError> {
-	let nsm_response = put_manifest_and_pivot(state, manifest_envelope, pivot)?;
+	let manifest_envelope = manifest_envelope.into();
+	let nsm_response =
+		put_manifest_and_pivot(state, &manifest_envelope, pivot)?;
 	Ok(nsm_response)
 }
 
 pub(in crate::protocol) fn export_key(
 	state: &mut ProtocolState,
-	new_manifest_envelope: &ManifestEnvelope,
+	new_manifest_envelope: impl Into<VersionedManifestEnvelope>,
 	cose_sign1_attestation_document: &[u8],
 ) -> Result<EncryptedQuorumKey, ProtocolError> {
+	let new_manifest_envelope = new_manifest_envelope.into();
 	// 1. Check the basic validity of the attestation doc (cert chain etc).
 	// Ensures that the attestation document is actually from an AWS controlled
 	// NSM module and the document's timestamp was recent.
@@ -93,47 +99,38 @@ pub(in crate::protocol) fn export_key(
 		&*state.attestor,
 	)?;
 
-	export_key_internal(state, new_manifest_envelope, &attestation_doc)
+	export_key_internal(state, &new_manifest_envelope, &attestation_doc)
 }
 
 // Primary logic of `export_key` pulled out so it can be unit tested.
 fn export_key_internal(
 	state: &mut ProtocolState,
-	new_manifest_envelope: &ManifestEnvelope,
+	new_manifest_envelope: impl Into<VersionedManifestEnvelope>,
 	attestation_doc: &AttestationDoc,
 ) -> Result<EncryptedQuorumKey, ProtocolError> {
+	let new_manifest_envelope = new_manifest_envelope.into();
 	let old_manifest_envelope = state.handles.get_manifest_envelope()?;
 	// steps 2 through 9
 	validate_manifest(
-		new_manifest_envelope,
+		&new_manifest_envelope,
 		&old_manifest_envelope,
 		attestation_doc,
 	)?;
 
-	let eph_key = {
-		#[cfg(not(feature = "mock"))]
-		{
-			let eph_key_bytes = attestation_doc
-				.public_key
-				.as_ref()
-				.ok_or(ProtocolError::MissingEphemeralKey)?;
-			P256Public::from_bytes(eph_key_bytes)
-				.map_err(|_| ProtocolError::InvalidEphemeralKey)?
-		}
-		#[cfg(feature = "mock")]
-		{
-			// For testing, the old enclave and new enclave will need to share
-			// an ephemeral key for this to work
-			state.handles.get_ephemeral_key()?.public_key()
-		}
-	};
+	let eph_key_bytes = attestation_doc
+		.public_key
+		.as_ref()
+		.ok_or(ProtocolError::MissingEphemeralKey)?;
+	let eph_key = P256Public::from_bytes(eph_key_bytes)
+		.map_err(|_| ProtocolError::InvalidEphemeralKey)?;
 
 	let quorum_key = state.handles.get_quorum_key()?;
 	// 10. Return the Quorum Key encrypted to the New Node's Ephemeral Key
 	// extracted from the attestation document and a signature over the
 	// encrypted payload. The Original Node uses its Quorum Key to create the
 	// signature.
-	let encrypted_quorum_key = eph_key.encrypt(quorum_key.to_master_seed())?;
+	let encrypted_quorum_key =
+		eph_key.encrypt(&quorum_key.to_master_seed()[..])?;
 	let signature = quorum_key.sign(&encrypted_quorum_key)?;
 
 	Ok(EncryptedQuorumKey { encrypted_quorum_key, signature })
@@ -141,31 +138,32 @@ fn export_key_internal(
 
 /// Manifest validation logic. Extracted to make unit testing easier.
 fn validate_manifest(
-	new_manifest_envelope: &ManifestEnvelope,
-	old_manifest_envelope: &ManifestEnvelope,
-	#[allow(unused_variables)] attestation_doc: &AttestationDoc,
+	new_manifest_envelope: impl Into<VersionedManifestEnvelope>,
+	old_manifest_envelope: impl Into<VersionedManifestEnvelope>,
+	attestation_doc: &AttestationDoc,
 ) -> Result<(), ProtocolError> {
+	let new_manifest_envelope = new_manifest_envelope.into();
+	let old_manifest_envelope = old_manifest_envelope.into();
 	// 2. Check the signatures over the New Manifest. Ensures that K Manifest
 	// Set Members approved the New Manifest.
 	new_manifest_envelope.check_approvals()?;
 
-	if !new_manifest_envelope.share_set_approvals.is_empty() {
+	if !new_manifest_envelope.share_set_approvals().is_empty() {
 		return Err(ProtocolError::BadShareSetApprovals);
 	}
+
+	let new_manifest = new_manifest_envelope.manifest();
+	let old_manifest = old_manifest_envelope.manifest();
 
 	// 3. Check that the Quorum Key of the Local Manifest matches the Quorum Key
 	// of the New Manifest. This ensures the request is for the correct Quorum
 	// Key.
-	if old_manifest_envelope.manifest.namespace.quorum_key
-		!= new_manifest_envelope.manifest.namespace.quorum_key
+	if old_manifest.namespace().quorum_key
+		!= new_manifest.namespace().quorum_key
 	{
 		return Err(ProtocolError::DifferentQuorumKey {
-			expected: qos_hex::encode(
-				&old_manifest_envelope.manifest.namespace.quorum_key,
-			),
-			actual: qos_hex::encode(
-				&new_manifest_envelope.manifest.namespace.quorum_key,
-			),
+			expected: qos_hex::encode(&old_manifest.namespace().quorum_key),
+			actual: qos_hex::encode(&new_manifest.namespace().quorum_key),
 		});
 	}
 
@@ -177,16 +175,25 @@ fn validate_manifest(
 	// Node - thus it's important to retire all Original Nodes ASAP that use
 	// compromised Manifest Sets.
 	{
-		let mut new_manifest = new_manifest_envelope.manifest.clone();
-		let mut old_manifest = old_manifest_envelope.manifest.clone();
-		new_manifest.manifest_set.members.sort();
-		old_manifest.manifest_set.members.sort();
-		if old_manifest.manifest_set != new_manifest.manifest_set {
+		let mut old_members = old_manifest.manifest_set().members.clone();
+		let mut new_members = new_manifest.manifest_set().members.clone();
+		old_members.sort();
+		new_members.sort();
+		if old_manifest.manifest_set().threshold
+			!= new_manifest.manifest_set().threshold
+			|| old_members != new_members
+		{
+			let old_set = crate::protocol::services::boot::ManifestSet {
+				threshold: old_manifest.manifest_set().threshold,
+				members: old_members,
+			};
+			let new_set = crate::protocol::services::boot::ManifestSet {
+				threshold: new_manifest.manifest_set().threshold,
+				members: new_members,
+			};
 			return Err(ProtocolError::DifferentManifestSet {
-				expected: qos_hex::encode(
-					&old_manifest.manifest_set.qos_hash(),
-				),
-				actual: qos_hex::encode(&new_manifest.manifest_set.qos_hash()),
+				expected: qos_hex::encode(&old_set.qos_hash()),
+				actual: qos_hex::encode(&new_set.qos_hash()),
 			});
 		}
 	}
@@ -195,12 +202,10 @@ fn validate_manifest(
 	// of the New Manifest. Namespaces are a social construct, but we only want
 	// to allow forwarding a Quorum Key to Nodes in the same Namespace to help
 	// ensure that the nonce is not abused.
-	if old_manifest_envelope.manifest.namespace.name
-		!= new_manifest_envelope.manifest.namespace.name
-	{
+	if old_manifest.namespace().name != new_manifest.namespace().name {
 		return Err(ProtocolError::DifferentNamespaceName {
-			expected: old_manifest_envelope.manifest.namespace.name.clone(),
-			actual: new_manifest_envelope.manifest.namespace.name.clone(),
+			expected: old_manifest.namespace().name.clone(),
+			actual: new_manifest.namespace().name.clone(),
 		});
 	}
 
@@ -213,46 +218,38 @@ fn validate_manifest(
 	// Members approving the manifest. In other words, we rely on the Manifest
 	// Set Members to correctly increment the nonce when any change is made to
 	// the latest manifest for a namespace.
-	if old_manifest_envelope.manifest.namespace.nonce
-		> new_manifest_envelope.manifest.namespace.nonce
-	{
+	if old_manifest.namespace().nonce > new_manifest.namespace().nonce {
 		return Err(ProtocolError::LowNonce {
-			expected: old_manifest_envelope.manifest.namespace.nonce,
-			actual: new_manifest_envelope.manifest.namespace.nonce,
+			expected: old_manifest.namespace().nonce,
+			actual: new_manifest.namespace().nonce,
 		});
-	} else if old_manifest_envelope.manifest.namespace.nonce
-		== new_manifest_envelope.manifest.namespace.nonce
-		&& old_manifest_envelope.manifest.qos_hash()
-			!= new_manifest_envelope.manifest.qos_hash()
+	} else if old_manifest.namespace().nonce == new_manifest.namespace().nonce
+		&& old_manifest.manifest_hash() != new_manifest.manifest_hash()
 	{
 		return Err(ProtocolError::DifferentManifest {
-			expected: qos_hex::encode(
-				&old_manifest_envelope.manifest.qos_hash(),
-			),
-			actual: qos_hex::encode(&new_manifest_envelope.manifest.qos_hash()),
+			expected: qos_hex::encode(&old_manifest.manifest_hash()),
+			actual: qos_hex::encode(&new_manifest.manifest_hash()),
 		});
 	}
 
-	// 7. Check that the hash of the new manifest is in the `user_data` field of
-	// the attestation doc.
-	//
-	// 8. Check that PCR0, PCR1, PCR2, and PCR3 in the New
-	// Manifest match the PCRs in the attestation document. This ensures the New
-	// Manifest was used against a Nitro enclave booted with the intended
-	// version of QOS. Note that we assume the values for PCR{0, 1 , 2}
-	// correspond to a desired version of QOS because the Manifest Set Members
-	// had K approvals.
-	#[cfg(not(feature = "mock"))]
-	{
-		qos_nsm::nitro::verify_attestation_doc_against_user_input(
-			attestation_doc,
-			&new_manifest_envelope.manifest.qos_hash(),
-			&new_manifest_envelope.manifest.enclave.pcr0,
-			&new_manifest_envelope.manifest.enclave.pcr1,
-			&new_manifest_envelope.manifest.enclave.pcr2,
-			&new_manifest_envelope.manifest.enclave.pcr3,
-		)?;
-	}
+	// 7. Verify the setup attestation against the New Manifest.
+	// This checks that the new manifest hash is in `user_data`, PCR0 through
+	// PCR3 match the New Manifest, every release-pinned PCR is present, and
+	// PCR16 matches the setup manifest/key commitment for the attested public
+	// key. This ensures the New Manifest was used against a Nitro enclave
+	// booted with the intended version of QOS. Note that we assume the values
+	// for PCR{0, 1, 2} correspond to a desired version of QOS because the
+	// Manifest Set Members had K approvals.
+	qos_nsm::nitro::verify_attestation_doc_against_manifest_setup(
+		attestation_doc,
+		qos_nsm::nitro::ManifestAttestationInput {
+			manifest_hash: &new_manifest.manifest_hash(),
+			pcr0: &new_manifest.enclave().pcr0,
+			pcr1: &new_manifest.enclave().pcr1,
+			pcr2: &new_manifest.enclave().pcr2,
+			pcr3: &new_manifest.enclave().pcr3,
+		},
+	)?;
 
 	// 9. Check that PCR3 in the New Manifest is in the Local Manifests. PCR3 is
 	// the IAM role assigned to the EC2 host of the enclave. An IAM role
@@ -261,16 +258,10 @@ fn validate_manifest(
 	// is controlled by the operator, not an enclave that some malicious entity
 	// runs that otherwise configured identically to one of the operator's
 	// enclaves.
-	if old_manifest_envelope.manifest.enclave.pcr3
-		!= new_manifest_envelope.manifest.enclave.pcr3
-	{
+	if old_manifest.enclave().pcr3 != new_manifest.enclave().pcr3 {
 		return Err(ProtocolError::DifferentPcr3 {
-			expected: qos_hex::encode(
-				&old_manifest_envelope.manifest.enclave.pcr3,
-			),
-			actual: qos_hex::encode(
-				&new_manifest_envelope.manifest.enclave.pcr3,
-			),
+			expected: qos_hex::encode(&old_manifest.enclave().pcr3),
+			actual: qos_hex::encode(&new_manifest.enclave().pcr3),
 		});
 	}
 
@@ -283,8 +274,9 @@ fn verify_and_extract_attestation_doc_from_der(
 ) -> Result<AttestationDoc, ProtocolError> {
 	let current_time_milliseconds = nsm.timestamp_ms()?;
 	let current_time_seconds = current_time_milliseconds / 1_000;
-	let der_cert = cert_from_pem(AWS_ROOT_CERT_PEM)
-		.expect("hardcoded cert is valid. qed.");
+	// The trust anchor follows the NSM provider: the AWS Nitro root CA in
+	// production, or the mock root CA when running with a mock provider.
+	let der_cert = nsm.attestation_root_ca_der();
 	attestation_doc_from_der(cose_sign1_der, &der_cert, current_time_seconds)
 		.map_err(Into::into)
 }
@@ -295,24 +287,31 @@ mod test {
 
 	use aws_nitro_enclaves_nsm_api::api::{AttestationDoc, Digest};
 	use qos_crypto::sha_256;
-	use qos_nsm::{mock::MockNsm, types::NsmResponse};
+	use qos_nsm::{
+		NsmProvider,
+		mock::MockNsm,
+		nitro,
+		types::{NsmRequest, NsmResponse},
+	};
 	use qos_p256::P256Pair;
 	use qos_test_primitives::PathWrapper;
 	use serde_bytes::ByteBuf;
 
-	use super::{boot_key_forward, export_key_internal, validate_manifest};
+	use super::{
+		boot_key_forward, export_key, export_key_internal, validate_manifest,
+	};
 	use crate::{
 		handles::Handles,
 		protocol::{
+			ProtocolError, ProtocolPhase, ProtocolState, QosHash,
 			services::{
 				boot::{
 					Approval, Manifest, ManifestEnvelope, ManifestSet,
 					Namespace, NitroConfig, PivotConfig, QuorumMember,
 					RestartPolicy, ShareSet,
 				},
-				key::{inject_key, EncryptedQuorumKey},
+				key::{EncryptedQuorumKey, inject_key},
 			},
-			ProtocolError, ProtocolPhase, ProtocolState, QosHash,
 		},
 	};
 
@@ -326,6 +325,7 @@ mod test {
 		pivot: Vec<u8>,
 	}
 
+	#[allow(clippy::too_many_lines)]
 	fn get_test_args() -> TestArgs {
 		let quorum_pair = P256Pair::generate().unwrap();
 		let member1_pair = P256Pair::generate().unwrap();
@@ -394,14 +394,32 @@ mod test {
 			})
 			.collect();
 
+		let eph_pair = P256Pair::generate().unwrap();
+		let eph_pub_key = eph_pair.public_key().to_bytes();
+
 		let mut pcr_map = BTreeMap::new();
+		for idx in 0..nitro::ATTESTABLE_PCR_COUNT {
+			pcr_map.insert(
+				usize::from(idx),
+				ByteBuf::from(vec![0u8; nitro::PCR_SHA384_LEN]),
+			);
+		}
 		pcr_map.insert(0, ByteBuf::from(pcr0));
 		pcr_map.insert(1, ByteBuf::from(pcr1));
 		pcr_map.insert(2, ByteBuf::from(pcr2));
 		pcr_map.insert(3, ByteBuf::from(pcr3));
-
-		let eph_pair = P256Pair::generate().unwrap();
-		let eph_pub_key = eph_pair.public_key().to_bytes();
+		pcr_map.insert(
+			usize::from(nitro::SETUP_MANIFEST_COMMITMENT_PCR_INDEX),
+			ByteBuf::from(
+				nitro::expected_manifest_commitment_pcr(
+					nitro::ManifestCommitmentKind::Setup,
+					&manifest.qos_hash(),
+					&eph_pub_key,
+				)
+				.unwrap()
+				.to_vec(),
+			),
+		);
 
 		let att_doc = AttestationDoc {
 			module_id: String::default(),
@@ -449,13 +467,16 @@ mod test {
 			);
 
 			let handles = Handles::new(
-				ephemeral_file.to_str().map(ToString::to_string).unwrap(),
+				ephemeral_file.display().to_string(),
 				"qorum".to_string(),
-				manifest_file.to_str().map(ToString::to_string).unwrap(),
-				pivot_file.to_str().map(ToString::to_string).unwrap(),
+				manifest_file.display().to_string(),
+				pivot_file.display().to_string(),
 			);
-			let mut state =
-				ProtocolState::new(Box::new(MockNsm), handles.clone(), None);
+			let mut state = ProtocolState::new(
+				Box::new(MockNsm::new()),
+				handles.clone(),
+				None,
+			);
 
 			let response =
 				boot_key_forward(&mut state, &manifest_envelope, &pivot)
@@ -469,7 +490,9 @@ mod test {
 			assert!(handles.pivot_exists());
 			assert_eq!(
 				handles.get_manifest_envelope().unwrap(),
-				manifest_envelope
+				crate::protocol::services::boot::VersionedManifestEnvelope::V1(
+					manifest_envelope,
+				)
 			);
 
 			handles.get_ephemeral_key().unwrap();
@@ -486,16 +509,20 @@ mod test {
 				"/tmp/boot_key_rejects_manifest_if_not_enough_approvals.secret",
 			);
 			let manifest_file = PathWrapper::from(
-				"/tmp/boot_key_rejects_manifest_if_not_enough_approvals.manifest");
+				"/tmp/boot_key_rejects_manifest_if_not_enough_approvals.manifest",
+			);
 
 			let handles = Handles::new(
-				ephemeral_file.to_str().map(ToString::to_string).unwrap(),
+				ephemeral_file.display().to_string(),
 				"qorum".to_string(),
-				manifest_file.to_str().map(ToString::to_string).unwrap(),
-				pivot_file.to_str().map(ToString::to_string).unwrap(),
+				manifest_file.display().to_string(),
+				pivot_file.display().to_string(),
 			);
-			let mut state =
-				ProtocolState::new(Box::new(MockNsm), handles.clone(), None);
+			let mut state = ProtocolState::new(
+				Box::new(MockNsm::new()),
+				handles.clone(),
+				None,
+			);
 
 			// Remove an approval
 			manifest_envelope.manifest_set_approvals.pop().unwrap();
@@ -527,13 +554,16 @@ mod test {
 			);
 
 			let handles = Handles::new(
-				ephemeral_file.to_str().map(ToString::to_string).unwrap(),
+				ephemeral_file.display().to_string(),
 				"qorum".to_string(),
-				manifest_file.to_str().map(ToString::to_string).unwrap(),
-				pivot_file.to_str().map(ToString::to_string).unwrap(),
+				manifest_file.display().to_string(),
+				pivot_file.display().to_string(),
 			);
-			let mut state =
-				ProtocolState::new(Box::new(MockNsm), handles.clone(), None);
+			let mut state = ProtocolState::new(
+				Box::new(MockNsm::new()),
+				handles.clone(),
+				None,
+			);
 
 			// Use a different pivot then what is referenced in the manifest
 			let other_pivot = b"other pivot".to_vec();
@@ -559,23 +589,26 @@ mod test {
 			let TestArgs { mut manifest_envelope, pivot, .. } = get_test_args();
 
 			let pivot_file = PathWrapper::from(
-				"/tmp/boot_key_rejects_rejects_manifest_with_bad_approval_signature.pivot"
+				"/tmp/boot_key_rejects_rejects_manifest_with_bad_approval_signature.pivot",
 			);
 			let ephemeral_file = PathWrapper::from(
-				"/tmp/boot_key_rejects_rejects_manifest_with_bad_approval_signature.secret"
+				"/tmp/boot_key_rejects_rejects_manifest_with_bad_approval_signature.secret",
 			);
 			let manifest_file = PathWrapper::from(
-				"/tmp/boot_key_rejects_rejects_manifest_with_bad_approval_signature.manifest"
+				"/tmp/boot_key_rejects_rejects_manifest_with_bad_approval_signature.manifest",
 			);
 
 			let handles = Handles::new(
-				ephemeral_file.to_str().map(ToString::to_string).unwrap(),
+				ephemeral_file.display().to_string(),
 				"quorum".to_string(),
-				manifest_file.to_str().map(ToString::to_string).unwrap(),
-				pivot_file.to_str().map(ToString::to_string).unwrap(),
+				manifest_file.display().to_string(),
+				pivot_file.display().to_string(),
 			);
-			let mut state =
-				ProtocolState::new(Box::new(MockNsm), handles.clone(), None);
+			let mut state = ProtocolState::new(
+				Box::new(MockNsm::new()),
+				handles.clone(),
+				None,
+			);
 
 			// Change the signature to something invalid
 			manifest_envelope.manifest_set_approvals[0].signature = vec![1; 32];
@@ -615,20 +648,26 @@ mod test {
 			};
 
 			let pivot_file = PathWrapper::from(
-				"/tmp/boot_key_reject_manifest_with_approval_from_non_memberpivot");
+				"/tmp/boot_key_reject_manifest_with_approval_from_non_memberpivot",
+			);
 			let ephemeral_file = PathWrapper::from(
-				"/tmp/boot_key_reject_manifest_with_approval_from_non_membersecret");
+				"/tmp/boot_key_reject_manifest_with_approval_from_non_membersecret",
+			);
 			let manifest_file = PathWrapper::from(
-				"/tmp/boot_key_reject_manifest_with_approval_from_non_membermanifest");
+				"/tmp/boot_key_reject_manifest_with_approval_from_non_membermanifest",
+			);
 
 			let handles = Handles::new(
-				ephemeral_file.to_str().map(ToString::to_string).unwrap(),
+				ephemeral_file.display().to_string(),
 				"quorum".to_string(),
-				manifest_file.to_str().map(ToString::to_string).unwrap(),
-				pivot_file.to_str().map(ToString::to_string).unwrap(),
+				manifest_file.display().to_string(),
+				pivot_file.display().to_string(),
 			);
-			let mut state =
-				ProtocolState::new(Box::new(MockNsm), handles.clone(), None);
+			let mut state = ProtocolState::new(
+				Box::new(MockNsm::new()),
+				handles.clone(),
+				None,
+			);
 
 			// Add an approval from a random key
 			manifest_envelope.manifest_set_approvals.push(non_member_approval);
@@ -652,12 +691,14 @@ mod test {
 		#[test]
 		fn accepts_matching_manifests() {
 			let TestArgs { manifest_envelope, att_doc, .. } = get_test_args();
-			assert!(validate_manifest(
-				&manifest_envelope,
-				&manifest_envelope,
-				&att_doc
-			)
-			.is_ok());
+			assert!(
+				validate_manifest(
+					&manifest_envelope,
+					&manifest_envelope,
+					&att_doc
+				)
+				.is_ok()
+			);
 		}
 
 		#[test]
@@ -666,12 +707,14 @@ mod test {
 			let mut old_manifest_envelope = manifest_envelope.clone();
 			old_manifest_envelope.manifest.namespace.nonce -= 1;
 
-			assert!(validate_manifest(
-				&manifest_envelope,
-				&old_manifest_envelope,
-				&att_doc
-			)
-			.is_ok());
+			assert!(
+				validate_manifest(
+					&manifest_envelope,
+					&old_manifest_envelope,
+					&att_doc
+				)
+				.is_ok()
+			);
 		}
 
 		#[test]
@@ -767,12 +810,14 @@ mod test {
 
 			old_manifest_envelope.manifest.namespace.nonce -= 1;
 
-			assert!(validate_manifest(
-				&manifest_envelope,
-				&old_manifest_envelope,
-				&att_doc
-			)
-			.is_ok(),);
+			assert!(
+				validate_manifest(
+					&manifest_envelope,
+					&old_manifest_envelope,
+					&att_doc
+				)
+				.is_ok(),
+			);
 		}
 
 		#[test]
@@ -877,8 +922,7 @@ mod test {
 		}
 	}
 
-	#[cfg(not(feature = "mock"))]
-	mod validate_manifest_mock_disabled_tests {
+	mod validate_manifest_attestation_tests {
 		use super::*;
 		#[test]
 		fn errors_if_pcr0_does_match_attestation_doc() {
@@ -1075,6 +1119,206 @@ mod test {
 		use super::*;
 		use crate::protocol::services::key::EncryptedQuorumKey;
 
+		/// Set up handles for an "old" enclave that has a manifest, quorum
+		/// key, and its own ephemeral key on disk.
+		fn setup_export_key_handles(
+			name: &str,
+			manifest_envelope: &ManifestEnvelope,
+			quorum_pair: &P256Pair,
+		) -> Handles {
+			let temp_dir = std::env::temp_dir();
+			let ephemeral_file = temp_dir
+				.join(format!("{name}.eph.secret"))
+				.to_string_lossy()
+				.into_owned();
+			let quorum_file = temp_dir
+				.join(format!("{name}.quorum.secret"))
+				.to_string_lossy()
+				.into_owned();
+			let manifest_file = temp_dir
+				.join(format!("{name}.manifest"))
+				.to_string_lossy()
+				.into_owned();
+
+			P256Pair::generate().unwrap().to_hex_file(&ephemeral_file).unwrap();
+			quorum_pair.to_hex_file(&quorum_file).unwrap();
+			std::fs::write(
+				&manifest_file,
+				serde_json::to_vec(manifest_envelope).unwrap(),
+			)
+			.unwrap();
+
+			Handles::new(
+				ephemeral_file,
+				quorum_file,
+				manifest_file,
+				"pivot".to_string(),
+			)
+		}
+
+		/// Build a mock NSM whose PCR bank matches the manifest measurements
+		/// and setup commitment, mirroring the state of a "new" enclave that
+		/// booted with `manifest_envelope` and `eph_pair`.
+		fn new_enclave_mock_nsm(
+			manifest_envelope: &ManifestEnvelope,
+			eph_pair: &P256Pair,
+		) -> MockNsm {
+			let manifest = &manifest_envelope.manifest;
+			let setup_commitment_pcr = nitro::expected_manifest_commitment_pcr(
+				nitro::ManifestCommitmentKind::Setup,
+				&manifest.qos_hash(),
+				&eph_pair.public_key().to_bytes(),
+			)
+			.unwrap();
+
+			MockNsm::new()
+				.with_pcr(0, manifest.enclave.pcr0.clone())
+				.with_pcr(1, manifest.enclave.pcr1.clone())
+				.with_pcr(2, manifest.enclave.pcr2.clone())
+				.with_pcr(3, manifest.enclave.pcr3.clone())
+				.with_pcr(
+					nitro::SETUP_MANIFEST_COMMITMENT_PCR_INDEX,
+					setup_commitment_pcr.to_vec(),
+				)
+		}
+
+		/// Request a signed attestation document like a "new" enclave would
+		/// return from a key forward boot.
+		fn signed_attestation_document(
+			nsm: &MockNsm,
+			manifest_envelope: &ManifestEnvelope,
+			eph_pair: &P256Pair,
+		) -> Vec<u8> {
+			let NsmResponse::Attestation { document } = nsm
+				.nsm_process_request(NsmRequest::Attestation {
+					user_data: Some(
+						manifest_envelope.manifest.qos_hash().to_vec(),
+					),
+					nonce: None,
+					public_key: Some(eph_pair.public_key().to_bytes()),
+				})
+			else {
+				panic!("expected attestation response");
+			};
+			document
+		}
+
+		#[test]
+		fn export_key_works_with_fully_verified_attestation_doc() {
+			let TestArgs { manifest_envelope, eph_pair, quorum_pair, .. } =
+				get_test_args();
+			let handles = setup_export_key_handles(
+				"export_key_works_with_fully_verified_attestation_doc",
+				&manifest_envelope,
+				&quorum_pair,
+			);
+
+			let nsm = new_enclave_mock_nsm(&manifest_envelope, &eph_pair);
+			let document = signed_attestation_document(
+				&nsm,
+				&manifest_envelope,
+				&eph_pair,
+			);
+
+			let mut state = ProtocolState::new(Box::new(nsm), handles, None);
+			let EncryptedQuorumKey { encrypted_quorum_key, signature } =
+				export_key(&mut state, &manifest_envelope, &document).unwrap();
+
+			// quorum key signature over payload is valid
+			assert!(
+				quorum_pair
+					.public_key()
+					.verify(&encrypted_quorum_key, &signature)
+					.is_ok()
+			);
+			// the quorum key was encrypted to the *attested* ephemeral key
+			let decrypted_quorum_secret =
+				eph_pair.decrypt(&encrypted_quorum_key).unwrap();
+			let reconstructed_quorum_pair =
+				P256Pair::from_master_seed(&zeroize::Zeroizing::new(
+					decrypted_quorum_secret[..].try_into().unwrap(),
+				))
+				.unwrap();
+			assert!(quorum_pair == reconstructed_quorum_pair);
+		}
+
+		#[test]
+		fn export_key_rejects_doc_not_signed_by_the_trusted_root() {
+			/// A provider that serves mock-signed attestation docs but
+			/// trusts the (default) AWS Nitro root when verifying peers.
+			struct AwsRootMockNsm(MockNsm);
+			impl NsmProvider for AwsRootMockNsm {
+				fn nsm_process_request(
+					&self,
+					request: NsmRequest,
+				) -> NsmResponse {
+					self.0.nsm_process_request(request)
+				}
+				fn timestamp_ms(&self) -> Result<u64, nitro::AttestError> {
+					self.0.timestamp_ms()
+				}
+				// `attestation_root_ca_der` is intentionally NOT overridden:
+				// the default is the AWS Nitro root CA.
+			}
+
+			let TestArgs { manifest_envelope, eph_pair, quorum_pair, .. } =
+				get_test_args();
+			let handles = setup_export_key_handles(
+				"export_key_rejects_doc_not_signed_by_the_trusted_root",
+				&manifest_envelope,
+				&quorum_pair,
+			);
+
+			let nsm = new_enclave_mock_nsm(&manifest_envelope, &eph_pair);
+			let document = signed_attestation_document(
+				&nsm,
+				&manifest_envelope,
+				&eph_pair,
+			);
+
+			let mut state = ProtocolState::new(
+				Box::new(AwsRootMockNsm(nsm)),
+				handles,
+				None,
+			);
+			let Err(err) =
+				export_key(&mut state, &manifest_envelope, &document)
+			else {
+				panic!("expected export_key to reject the document");
+			};
+
+			assert!(matches!(err, ProtocolError::QosAttestError(_)));
+		}
+
+		#[test]
+		fn export_key_rejects_doc_with_wrong_pcrs() {
+			let TestArgs { manifest_envelope, eph_pair, quorum_pair, .. } =
+				get_test_args();
+			let handles = setup_export_key_handles(
+				"export_key_rejects_doc_with_wrong_pcrs",
+				&manifest_envelope,
+				&quorum_pair,
+			);
+
+			// PCR0 does not match the manifest.
+			let nsm = new_enclave_mock_nsm(&manifest_envelope, &eph_pair)
+				.with_pcr(0, vec![128; 32]);
+			let document = signed_attestation_document(
+				&nsm,
+				&manifest_envelope,
+				&eph_pair,
+			);
+
+			let mut state = ProtocolState::new(Box::new(nsm), handles, None);
+			let Err(err) =
+				export_key(&mut state, &manifest_envelope, &document)
+			else {
+				panic!("expected export_key to reject the document");
+			};
+
+			assert!(matches!(err, ProtocolError::QosAttestError(_)));
+		}
+
 		#[test]
 		fn works() {
 			let TestArgs {
@@ -1102,14 +1346,14 @@ mod test {
 			)
 			.unwrap();
 			let handles = Handles::new(
-				ephemeral_file.to_str().map(ToString::to_string).unwrap(),
-				quorum_file.to_str().map(ToString::to_string).unwrap(),
-				manifest_file.to_str().map(ToString::to_string).unwrap(),
+				ephemeral_file.display().to_string(),
+				quorum_file.display().to_string(),
+				manifest_file.display().to_string(),
 				"pivot".to_string(),
 			);
 
 			let mut protocol_state =
-				ProtocolState::new(Box::new(MockNsm), handles, None);
+				ProtocolState::new(Box::new(MockNsm::new()), handles, None);
 			let EncryptedQuorumKey { encrypted_quorum_key, signature } =
 				export_key_internal(
 					&mut protocol_state,
@@ -1119,17 +1363,20 @@ mod test {
 				.unwrap();
 
 			// quorum key signature over payload is valid
-			assert!(quorum_pair
-				.public_key()
-				.verify(&encrypted_quorum_key, &signature)
-				.is_ok());
+			assert!(
+				quorum_pair
+					.public_key()
+					.verify(&encrypted_quorum_key, &signature)
+					.is_ok()
+			);
 
 			let decrypted_quorum_secret =
 				eph_pair.decrypt(&encrypted_quorum_key).unwrap();
-			let reconstructed_quorum_pair = P256Pair::from_master_seed(
-				&decrypted_quorum_secret.try_into().unwrap(),
-			)
-			.unwrap();
+			let reconstructed_quorum_pair =
+				P256Pair::from_master_seed(&zeroize::Zeroizing::new(
+					decrypted_quorum_secret[..].try_into().unwrap(),
+				))
+				.unwrap();
 			assert!(quorum_pair == reconstructed_quorum_pair);
 		}
 	}
@@ -1159,18 +1406,21 @@ mod test {
 
 			let encrypted_quorum_key = eph_pair
 				.public_key()
-				.encrypt(quorum_pair.to_master_seed())
+				.encrypt(&quorum_pair.to_master_seed()[..])
 				.unwrap();
 			let signature = quorum_pair.sign(&encrypted_quorum_key).unwrap();
 
 			let handles = Handles::new(
-				ephemeral_file.to_str().map(ToString::to_string).unwrap(),
-				quorum_file.to_str().map(ToString::to_string).unwrap(),
-				manifest_file.to_str().map(ToString::to_string).unwrap(),
+				ephemeral_file.display().to_string(),
+				quorum_file.display().to_string(),
+				manifest_file.display().to_string(),
 				"pivot".to_string(),
 			);
 			let mut protocol_state =
-				ProtocolState::new(Box::new(MockNsm), handles, None);
+				ProtocolState::new(Box::new(MockNsm::new()), handles, None);
+			let live_eph_pair = P256Pair::generate().unwrap();
+			protocol_state
+				.set_pending_live_ephemeral_key(live_eph_pair.clone());
 			protocol_state
 				.transition(ProtocolPhase::WaitingForForwardedKey)
 				.unwrap();
@@ -1194,6 +1444,10 @@ mod test {
 			// Make sure the EK still exists, and ensure rotation happened post injection
 			let new_eph_key = std::fs::read(&*ephemeral_file).unwrap();
 			assert_ne!(new_eph_key, boot_eph_key);
+			assert_eq!(
+				new_eph_key,
+				live_eph_pair.to_master_seed_hex().as_slice()
+			);
 		}
 
 		#[test]
@@ -1217,18 +1471,18 @@ mod test {
 			let wrong_key = P256Pair::generate().unwrap();
 			let encrypted_quorum_key = eph_pair
 				.public_key()
-				.encrypt(wrong_key.to_master_seed())
+				.encrypt(&wrong_key.to_master_seed()[..])
 				.unwrap();
 			let signature = quorum_pair.sign(&encrypted_quorum_key).unwrap();
 
 			let handles = Handles::new(
-				ephemeral_file.to_str().map(ToString::to_string).unwrap(),
-				quorum_file.to_str().map(ToString::to_string).unwrap(),
-				manifest_file.to_str().map(ToString::to_string).unwrap(),
+				ephemeral_file.display().to_string(),
+				quorum_file.display().to_string(),
+				manifest_file.display().to_string(),
 				"pivot".to_string(),
 			);
 			let mut protocol_state =
-				ProtocolState::new(Box::new(MockNsm), handles, None);
+				ProtocolState::new(Box::new(MockNsm::new()), handles, None);
 
 			assert_eq!(
 				inject_key(
@@ -1271,18 +1525,18 @@ mod test {
 			let wrong_key = P256Pair::generate().unwrap();
 			let encrypted_quorum_key = eph_pair
 				.public_key()
-				.encrypt(quorum_pair.to_master_seed())
+				.encrypt(&quorum_pair.to_master_seed()[..])
 				.unwrap();
 			let signature = wrong_key.sign(&encrypted_quorum_key).unwrap();
 
 			let handles = Handles::new(
-				ephemeral_file.to_str().map(ToString::to_string).unwrap(),
-				quorum_file.to_str().map(ToString::to_string).unwrap(),
-				manifest_file.to_str().map(ToString::to_string).unwrap(),
+				ephemeral_file.display().to_string(),
+				quorum_file.display().to_string(),
+				manifest_file.display().to_string(),
 				"pivot".to_string(),
 			);
 			let mut protocol_state =
-				ProtocolState::new(Box::new(MockNsm), handles, None);
+				ProtocolState::new(Box::new(MockNsm::new()), handles, None);
 
 			assert_eq!(
 				inject_key(
@@ -1322,7 +1576,8 @@ mod test {
 			)
 			.unwrap();
 
-			let mut invalid_master_seed = quorum_pair.to_master_seed().to_vec();
+			let mut invalid_master_seed =
+				zeroize::Zeroizing::new(quorum_pair.to_master_seed().to_vec());
 			invalid_master_seed.remove(0);
 			let invalid_encrypted_quorum_key =
 				eph_pair.public_key().encrypt(&invalid_master_seed).unwrap();
@@ -1330,13 +1585,13 @@ mod test {
 				quorum_pair.sign(&invalid_encrypted_quorum_key).unwrap();
 
 			let handles = Handles::new(
-				ephemeral_file.to_str().map(ToString::to_string).unwrap(),
-				quorum_file.to_str().map(ToString::to_string).unwrap(),
-				manifest_file.to_str().map(ToString::to_string).unwrap(),
+				ephemeral_file.display().to_string(),
+				quorum_file.display().to_string(),
+				manifest_file.display().to_string(),
 				"pivot".to_string(),
 			);
 			let mut protocol_state =
-				ProtocolState::new(Box::new(MockNsm), handles, None);
+				ProtocolState::new(Box::new(MockNsm::new()), handles, None);
 
 			assert_eq!(
 				inject_key(

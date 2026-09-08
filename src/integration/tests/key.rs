@@ -3,7 +3,7 @@ use std::{fs, process::Command};
 use integration::{
 	LOCAL_HOST, PCR3_PRE_IMAGE_PATH, PIVOT_LOOP_PATH, QOS_DIST_DIR,
 };
-use qos_crypto::sha_256;
+use qos_crypto::{sha_256, sha_384};
 use qos_p256::{P256Pair, P256Public};
 use qos_test_primitives::{ChildWrapper, PathWrapper};
 
@@ -20,7 +20,8 @@ const USERS: &[&str] = &["user1", "user2", "user3"];
 const TEST_MSG: &str = "test-msg";
 const NEW_ATTESTATION_DOC_PATH: &str = "/tmp/key-fwd-e2e/new_attestation_doc";
 const ENCRYPTED_QUORUM_KEY_PATH: &str = "/tmp/key-fwd-e2e/encrypted_quorum_key";
-const SHARED_EPH_PATH: &str = "/tmp/key-fwd-e2e/shared_eph.secret";
+const OLD_EPH_PATH: &str = "/tmp/key-fwd-e2e/old_eph.secret";
+const NEW_EPH_PATH: &str = "/tmp/key-fwd-e2e/new_eph.secret";
 const QUORUM_KEY_PUB_PATH: &str =
 	"./mock/namespaces/quit-coding-to-vape/quorum_key.pub";
 
@@ -29,39 +30,19 @@ async fn key_fwd_e2e() {
 	// Make sure everything in the temp dir gets dropped
 	let _ = PathWrapper::from(TMP_DIR);
 	fs::create_dir_all(BOOT_DIR).unwrap();
+	// Seed both mock enclaves with PCR values matching the manifest so the
+	// OLD enclave can fully verify the NEW enclave's attestation document
+	// during key export. This is the mock analog of both enclaves running
+	// the image measured by the manifest.
+	let mock_pcrs_file = write_mock_pcrs();
+	let mock_pcrs_path = mock_pcrs_file.to_str().unwrap();
 	let old_host_port = qos_test_primitives::find_free_port().unwrap();
 	let new_host_port = qos_test_primitives::find_free_port().unwrap();
 
 	build_pivot_fingerprints();
 	generate_manifest_envelope();
 	let (_enclave_child_wrapper, _host_child_wrapper) =
-		boot_old_enclave(old_host_port);
-
-	// We manually remove the ephemeral key file because if we didn't, we'd get a failure from the
-	// NEW enclave: as it comes up it'd try to write its ephemeral key at `SHARED_EPH_PATH` and fail
-	// to write because the file already exists.
-	// Why does the file already exist? Because the OLD enclave already persisted its ephemeral key
-	// there (and why is this a problem you ask? Well, that's just the semantics of `write_as_read_only`
-	// -- for security reasons, we want to avoid silently/accidentally overriding key material)
-	//
-	// Another question you might ask is: why do we need to share this ephemeral key path at all?
-	// Can't we just give OLD and NEW enclaves their own ephemeral path and be done?
-	// That's a nice thought, but unfortunately we can't quite do that. To perform a key-forward boot,
-	// in normal conditions, the OLD enclave encrypts its quorum key to the NEW enclave's ephemeral
-	// public key. The "transport" mechanism for this public key is the AWS attestation (`public_key` field).
-	// Which means we'd need to produce AWS attestations dynamically. And unfortunately, that's just a pain
-	// in the rear to mock/produce in testing. So here we are.
-	//
-	// The solution we've found is to share the ephemeral key between OLD and NEW enclave AND have
-	// a special case: when `qos_core` is compiled with the `mock` feature, the OLD enclave encrypts its
-	// quorum key to its _own_ ephemeral public key (rather than the AWS attestation `public_key` field.)
-	// See `export_key_internal` for details.
-	//
-	// Because the OLD and NEW enclave share the ephemeral key path, the NEW enclave can trivially decrypt
-	// the encrypted quorum key that is injected, and the integration test works.
-	//
-	// This is obviously a test-only quirk: in a real situation enclaves have their own filesystems..!
-	fs::remove_file(SHARED_EPH_PATH).unwrap();
+		boot_old_enclave(old_host_port, mock_pcrs_path);
 
 	// start up new enclave
 	let new_secret_path = "/tmp/key-fwd-e2e/new_secret.secret";
@@ -80,10 +61,10 @@ async fn key_fwd_e2e() {
 				"--pivot-file",
 				new_pivot_path,
 				"--ephemeral-file",
-				SHARED_EPH_PATH, /* this is shared so the old enclave can
-				                  * encrypt to this key. See `extract_key`
-				                  * logic */
+				NEW_EPH_PATH,
 				"--mock",
+				"--mock-pcrs",
+				mock_pcrs_path,
 				"--manifest-file",
 				new_manifest_path,
 			])
@@ -110,63 +91,69 @@ async fn key_fwd_e2e() {
 	qos_test_primitives::wait_until_port_is_bound(new_host_port);
 
 	// -- CLIENT broadcast boot key fwd instruction
-	assert!(Command::new(integration::QOS_CLIENT_PATH)
-		.args([
-			"boot-key-fwd",
-			"--manifest-envelope-path",
-			MANIFEST_ENVELOPE_PATH,
-			"--pivot-path",
-			PIVOT_LOOP_PATH,
-			"--attestation-doc-path",
-			NEW_ATTESTATION_DOC_PATH,
-			"--host-port",
-			&new_host_port.to_string(),
-			"--host-ip",
-			LOCAL_HOST,
-		])
-		.spawn()
-		.unwrap()
-		.wait()
-		.unwrap()
-		.success());
+	assert!(
+		Command::new(integration::QOS_CLIENT_PATH)
+			.args([
+				"boot-key-fwd",
+				"--manifest-envelope-path",
+				MANIFEST_ENVELOPE_PATH,
+				"--pivot-path",
+				PIVOT_LOOP_PATH,
+				"--attestation-doc-path",
+				NEW_ATTESTATION_DOC_PATH,
+				"--host-port",
+				&new_host_port.to_string(),
+				"--host-ip",
+				LOCAL_HOST,
+			])
+			.spawn()
+			.unwrap()
+			.wait()
+			.unwrap()
+			.success()
+	);
 
 	// -- CLIENT broadcast key request to the old enclave
-	assert!(Command::new(integration::QOS_CLIENT_PATH)
-		.args([
-			"export-key",
-			"--manifest-envelope-path",
-			MANIFEST_ENVELOPE_PATH,
-			"--attestation-doc-path",
-			NEW_ATTESTATION_DOC_PATH,
-			"--encrypted-quorum-key-path",
-			ENCRYPTED_QUORUM_KEY_PATH,
-			"--host-port",
-			&old_host_port.to_string(),
-			"--host-ip",
-			LOCAL_HOST,
-		])
-		.spawn()
-		.unwrap()
-		.wait()
-		.unwrap()
-		.success());
+	assert!(
+		Command::new(integration::QOS_CLIENT_PATH)
+			.args([
+				"export-key",
+				"--manifest-envelope-path",
+				MANIFEST_ENVELOPE_PATH,
+				"--attestation-doc-path",
+				NEW_ATTESTATION_DOC_PATH,
+				"--encrypted-quorum-key-path",
+				ENCRYPTED_QUORUM_KEY_PATH,
+				"--host-port",
+				&old_host_port.to_string(),
+				"--host-ip",
+				LOCAL_HOST,
+			])
+			.spawn()
+			.unwrap()
+			.wait()
+			.unwrap()
+			.success()
+	);
 
 	// -- CLIENT broadcast encrypted quorum to the new enclave
-	assert!(Command::new(integration::QOS_CLIENT_PATH)
-		.args([
-			"inject-key",
-			"--encrypted-quorum-key-path",
-			ENCRYPTED_QUORUM_KEY_PATH,
-			"--host-port",
-			&new_host_port.to_string(),
-			"--host-ip",
-			LOCAL_HOST,
-		])
-		.spawn()
-		.unwrap()
-		.wait()
-		.unwrap()
-		.success());
+	assert!(
+		Command::new(integration::QOS_CLIENT_PATH)
+			.args([
+				"inject-key",
+				"--encrypted-quorum-key-path",
+				ENCRYPTED_QUORUM_KEY_PATH,
+				"--host-port",
+				&new_host_port.to_string(),
+				"--host-ip",
+				LOCAL_HOST,
+			])
+			.spawn()
+			.unwrap()
+			.wait()
+			.unwrap()
+			.success()
+	);
 
 	// Check that the quorum key got written
 	let quorum_pair = P256Pair::from_hex_file(new_secret_path).unwrap();
@@ -174,61 +161,55 @@ async fn key_fwd_e2e() {
 	assert!(quorum_pair.public_key() == quorum_pub);
 }
 
+/// Write a `--mock-pcrs` seed file with the same PCR{0, 1, 2, 3} values the
+/// manifest is generated against: PCR{0, 1, 2} from the QOS dist dir and
+/// PCR3 derived from the PCR3 pre-image (the IAM role arn).
+fn write_mock_pcrs() -> PathWrapper<std::path::PathBuf> {
+	let mut pcrs =
+		fs::read_to_string(format!("{QOS_DIST_DIR}/aws-x86_64.pcrs")).unwrap();
+	if !pcrs.ends_with('\n') {
+		pcrs.push('\n');
+	}
+
+	let role_arn = fs::read_to_string(PCR3_PRE_IMAGE_PATH)
+		.unwrap()
+		.lines()
+		.next()
+		.unwrap()
+		.to_string();
+	let mut pcr3_preimage = [0u8; 48].to_vec();
+	pcr3_preimage.extend_from_slice(role_arn.as_bytes());
+	let pcr3 = sha_384(&pcr3_preimage);
+	pcrs.push_str(&format!("{} PCR3\n", qos_hex::encode(&pcr3)));
+
+	let pcrs_path = std::env::temp_dir()
+		.join(format!("key-fwd-e2e-mock-pcrs-{}.pcrs", std::process::id()));
+	fs::write(&pcrs_path, pcrs).unwrap();
+	PathWrapper::from(pcrs_path)
+}
+
 fn generate_manifest_envelope() {
 	let pivot_args = format!("[--msg,{TEST_MSG}]");
-	assert!(Command::new(integration::QOS_CLIENT_PATH)
-		.args([
-			"generate-manifest",
-			"--nonce",
-			"2",
-			"--namespace",
-			NAMESPACE,
-			"--restart-policy",
-			"always",
-			"--pcr3-preimage-path",
-			PCR3_PRE_IMAGE_PATH,
-			"--pivot-hash-path",
-			PIVOT_HASH_PATH,
-			"--qos-release-dir",
-			QOS_DIST_DIR,
-			"--manifest-path",
-			CLI_MANIFEST_PATH,
-			"--pivot-args",
-			&pivot_args,
-			"--manifest-set-dir",
-			"./mock/keys/manifest-set",
-			"--share-set-dir",
-			"./mock/keys/share-set",
-			"--patch-set-dir",
-			"./mock/keys/manifest-set",
-			"--quorum-key-path",
-			QUORUM_KEY_PUB_PATH
-		])
-		.spawn()
-		.unwrap()
-		.wait()
-		.unwrap()
-		.success());
-
-	// -- CLIENT make sure each user can run `approve-manifest`
-	for alias in USERS {
-		let secret_path = format!("{}/{}.secret", &personal_dir(alias), alias);
-
-		assert!(Command::new(integration::QOS_CLIENT_PATH)
+	assert!(
+		Command::new(integration::QOS_CLIENT_PATH)
 			.args([
-				"approve-manifest",
-				"--secret-path",
-				&*secret_path,
-				"--manifest-path",
-				CLI_MANIFEST_PATH,
-				"--manifest-approvals-dir",
-				BOOT_DIR,
+				"generate-manifest",
+				"--nonce",
+				"2",
+				"--namespace",
+				NAMESPACE,
+				"--restart-policy",
+				"always",
 				"--pcr3-preimage-path",
 				PCR3_PRE_IMAGE_PATH,
 				"--pivot-hash-path",
 				PIVOT_HASH_PATH,
 				"--qos-release-dir",
 				QOS_DIST_DIR,
+				"--manifest-path",
+				CLI_MANIFEST_PATH,
+				"--pivot-args",
+				&pivot_args,
 				"--manifest-set-dir",
 				"./mock/keys/manifest-set",
 				"--share-set-dir",
@@ -236,20 +217,60 @@ fn generate_manifest_envelope() {
 				"--patch-set-dir",
 				"./mock/keys/manifest-set",
 				"--quorum-key-path",
-				QUORUM_KEY_PUB_PATH,
-				"--alias",
-				alias,
-				"--unsafe-auto-confirm",
+				QUORUM_KEY_PUB_PATH
 			])
 			.spawn()
 			.unwrap()
 			.wait()
 			.unwrap()
-			.success());
+			.success()
+	);
+
+	// -- CLIENT make sure each user can run `approve-manifest`
+	for alias in USERS {
+		let secret_path = format!("{}/{}.secret", personal_dir(alias), alias);
+
+		assert!(
+			Command::new(integration::QOS_CLIENT_PATH)
+				.args([
+					"approve-manifest",
+					"--secret-path",
+					&*secret_path,
+					"--manifest-path",
+					CLI_MANIFEST_PATH,
+					"--manifest-approvals-dir",
+					BOOT_DIR,
+					"--pcr3-preimage-path",
+					PCR3_PRE_IMAGE_PATH,
+					"--pivot-hash-path",
+					PIVOT_HASH_PATH,
+					"--qos-release-dir",
+					QOS_DIST_DIR,
+					"--manifest-set-dir",
+					"./mock/keys/manifest-set",
+					"--share-set-dir",
+					"./mock/keys/share-set",
+					"--patch-set-dir",
+					"./mock/keys/manifest-set",
+					"--quorum-key-path",
+					QUORUM_KEY_PUB_PATH,
+					"--alias",
+					alias,
+					"--unsafe-auto-confirm",
+				])
+				.spawn()
+				.unwrap()
+				.wait()
+				.unwrap()
+				.success()
+		);
 	}
 }
 
-fn boot_old_enclave(old_host_port: u16) -> (ChildWrapper, ChildWrapper) {
+fn boot_old_enclave(
+	old_host_port: u16,
+	mock_pcrs_path: &str,
+) -> (ChildWrapper, ChildWrapper) {
 	let old_secret_path = "/tmp/key-fwd-e2e/old_secret.secret";
 	let old_pivot_path = "/tmp/key-fwd-e2e/old_pivot.pivot";
 	let old_manifest_path = "/tmp/key-fwd-e2e/old_manifest.manifest";
@@ -266,8 +287,10 @@ fn boot_old_enclave(old_host_port: u16) -> (ChildWrapper, ChildWrapper) {
 				"--pivot-file",
 				old_pivot_path,
 				"--ephemeral-file",
-				SHARED_EPH_PATH,
+				OLD_EPH_PATH,
 				"--mock",
+				"--mock-pcrs",
+				mock_pcrs_path,
 				"--manifest-file",
 				old_manifest_path,
 			])
@@ -294,116 +317,126 @@ fn boot_old_enclave(old_host_port: u16) -> (ChildWrapper, ChildWrapper) {
 	qos_test_primitives::wait_until_port_is_bound(old_host_port);
 
 	// -- CLIENT generate the manifest envelope
-	assert!(Command::new(integration::QOS_CLIENT_PATH)
-		.args([
-			"generate-manifest-envelope",
-			"--manifest-approvals-dir",
-			BOOT_DIR,
-			"--manifest-path",
-			CLI_MANIFEST_PATH,
-		])
-		.spawn()
-		.unwrap()
-		.wait()
-		.unwrap()
-		.success());
-
-	// -- CLIENT broadcast boot standard instruction
-	assert!(Command::new(integration::QOS_CLIENT_PATH)
-		.args([
-			"boot-standard",
-			"--manifest-envelope-path",
-			MANIFEST_ENVELOPE_PATH,
-			"--pivot-path",
-			PIVOT_LOOP_PATH,
-			"--host-port",
-			&old_host_port.to_string(),
-			"--host-ip",
-			LOCAL_HOST,
-			"--pcr3-preimage-path",
-			PCR3_PRE_IMAGE_PATH,
-			"--unsafe-skip-attestation",
-		])
-		.spawn()
-		.unwrap()
-		.wait()
-		.unwrap()
-		.success());
-
-	assert!(Command::new(integration::QOS_CLIENT_PATH)
-		.args([
-			"get-attestation-doc",
-			"--host-port",
-			&old_host_port.to_string(),
-			"--host-ip",
-			LOCAL_HOST,
-			"--attestation-doc-path",
-			ATTESTATION_DOC_PATH,
-			"--manifest-envelope-path",
-			"/tmp/dont_care"
-		])
-		.spawn()
-		.unwrap()
-		.wait()
-		.unwrap()
-		.success());
-
-	for user in &USERS[0..2] {
-		let share_path = format!("{}/{}.share", &personal_dir(user), user);
-		let secret_path = format!("{}/{}.secret", &personal_dir(user), user);
-		let eph_wrapped_share_path =
-			PathWrapper::from(format!("{TMP_DIR}/{user}.eph_wrapped.share"));
-		let approval_path =
-			PathWrapper::from(format!("{TMP_DIR}/{user}.attestation.approval"));
-		assert!(Command::new(integration::QOS_CLIENT_PATH)
+	assert!(
+		Command::new(integration::QOS_CLIENT_PATH)
 			.args([
-				"proxy-re-encrypt-share",
-				"--share-path",
-				&share_path,
-				"--secret-path",
-				&secret_path,
-				"--attestation-doc-path",
-				ATTESTATION_DOC_PATH,
-				"--eph-wrapped-share-path",
-				eph_wrapped_share_path.to_str().unwrap(),
-				"--approval-path",
-				approval_path.to_str().unwrap(),
-				"--manifest-envelope-path",
-				MANIFEST_ENVELOPE_PATH,
-				"--pcr3-preimage-path",
-				PCR3_PRE_IMAGE_PATH,
-				"--manifest-set-dir",
-				"./mock/keys/manifest-set",
-				"--alias",
-				user,
-				"--unsafe-skip-attestation",
-				"--unsafe-eph-path-override",
-				SHARED_EPH_PATH,
-				"--unsafe-auto-confirm",
+				"generate-manifest-envelope",
+				"--manifest-approvals-dir",
+				BOOT_DIR,
+				"--manifest-path",
+				CLI_MANIFEST_PATH,
 			])
 			.spawn()
 			.unwrap()
 			.wait()
 			.unwrap()
-			.success());
+			.success()
+	);
 
-		assert!(Command::new(integration::QOS_CLIENT_PATH)
+	// -- CLIENT broadcast boot standard instruction
+	assert!(
+		Command::new(integration::QOS_CLIENT_PATH)
 			.args([
-				"post-share",
+				"boot-standard",
+				"--manifest-envelope-path",
+				MANIFEST_ENVELOPE_PATH,
+				"--pivot-path",
+				PIVOT_LOOP_PATH,
 				"--host-port",
 				&old_host_port.to_string(),
 				"--host-ip",
 				LOCAL_HOST,
-				"--eph-wrapped-share-path",
-				eph_wrapped_share_path.to_str().unwrap(),
-				"--approval-path",
-				approval_path.to_str().unwrap(),
+				"--pcr3-preimage-path",
+				PCR3_PRE_IMAGE_PATH,
+				"--unsafe-skip-attestation",
 			])
 			.spawn()
 			.unwrap()
 			.wait()
 			.unwrap()
-			.success());
+			.success()
+	);
+
+	assert!(
+		Command::new(integration::QOS_CLIENT_PATH)
+			.args([
+				"get-attestation-doc",
+				"--host-port",
+				&old_host_port.to_string(),
+				"--host-ip",
+				LOCAL_HOST,
+				"--attestation-doc-path",
+				ATTESTATION_DOC_PATH,
+				"--manifest-envelope-path",
+				"/tmp/dont_care"
+			])
+			.spawn()
+			.unwrap()
+			.wait()
+			.unwrap()
+			.success()
+	);
+
+	for user in &USERS[0..2] {
+		let share_path = format!("{}/{}.share", personal_dir(user), user);
+		let secret_path = format!("{}/{}.secret", personal_dir(user), user);
+		let eph_wrapped_share_path =
+			PathWrapper::from(format!("{TMP_DIR}/{user}.eph_wrapped.share"));
+		let approval_path =
+			PathWrapper::from(format!("{TMP_DIR}/{user}.attestation.approval"));
+		assert!(
+			Command::new(integration::QOS_CLIENT_PATH)
+				.args([
+					"proxy-re-encrypt-share",
+					"--share-path",
+					&share_path,
+					"--secret-path",
+					&secret_path,
+					"--attestation-doc-path",
+					ATTESTATION_DOC_PATH,
+					"--eph-wrapped-share-path",
+					eph_wrapped_share_path.to_str().unwrap(),
+					"--approval-path",
+					approval_path.to_str().unwrap(),
+					"--manifest-envelope-path",
+					MANIFEST_ENVELOPE_PATH,
+					"--pcr3-preimage-path",
+					PCR3_PRE_IMAGE_PATH,
+					"--manifest-set-dir",
+					"./mock/keys/manifest-set",
+					"--alias",
+					user,
+					"--unsafe-skip-attestation",
+					"--unsafe-eph-path-override",
+					OLD_EPH_PATH,
+					"--unsafe-auto-confirm",
+				])
+				.spawn()
+				.unwrap()
+				.wait()
+				.unwrap()
+				.success()
+		);
+
+		assert!(
+			Command::new(integration::QOS_CLIENT_PATH)
+				.args([
+					"post-share",
+					"--host-port",
+					&old_host_port.to_string(),
+					"--host-ip",
+					LOCAL_HOST,
+					"--eph-wrapped-share-path",
+					eph_wrapped_share_path.to_str().unwrap(),
+					"--approval-path",
+					approval_path.to_str().unwrap(),
+				])
+				.spawn()
+				.unwrap()
+				.wait()
+				.unwrap()
+				.success()
+		);
 	}
 
 	// Check that the enclave wrote its quorum key

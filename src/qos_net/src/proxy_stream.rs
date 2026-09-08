@@ -172,6 +172,7 @@ mod test {
 	use crate::proxy_connection::ProxyConnection;
 
 	#[tokio::test]
+	#[ignore = "requires external network"]
 	async fn can_fetch_and_parse_chunked_json_over_tls_with_local_stream() {
 		let host = "www.googleapis.com";
 		let path = "/oauth2/v3/certs";
@@ -190,7 +191,12 @@ mod test {
 
 		let server_name: rustls::pki_types::ServerName<'_> =
 			host.try_into().unwrap();
-		let config: rustls::ClientConfig = rustls::ClientConfig::builder()
+		let config: rustls::ClientConfig =
+			rustls::ClientConfig::builder_with_provider(Arc::new(
+				rustls::crypto::aws_lc_rs::default_provider(),
+			))
+			.with_safe_default_protocol_versions()
+			.unwrap()
 			.with_root_certificates(root_store)
 			.with_no_client_auth();
 		let conn = TlsConnector::from(Arc::new(config));

@@ -14,12 +14,12 @@
 //! * Responding with error: <https://github.com/tokio-rs/axum/blob/main/axum/src/docs/error_handling.md/>
 
 use axum::{
+	Json,
 	http::StatusCode,
 	response::{IntoResponse, Response},
-	Json,
 };
 use qos_core::protocol::{
-	services::boot::ManifestEnvelope, Hash256, ProtocolPhase,
+	Hash256, ProtocolPhase, services::boot::VersionedManifestEnvelope,
 };
 
 pub mod cli;
@@ -59,7 +59,7 @@ pub struct EnclaveInfo {
 	/// Current phase of the enclave.
 	pub phase: ProtocolPhase,
 	/// Manifest envelope in the enclave.
-	pub manifest_envelope: Option<ManifestEnvelope>,
+	pub manifest_envelope: Option<VersionedManifestEnvelope>,
 	/// Ephemeral public key from the live attestation doc.
 	pub ephemeral_key: Option<String>,
 }

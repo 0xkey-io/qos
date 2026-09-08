@@ -1,14 +1,19 @@
 //! Contains logic for remote connection establishment: DNS resolution and TCP
 //! connection.
 use std::{
+	collections::HashMap,
 	net::{AddrParseError, IpAddr, SocketAddr},
+	sync::{Arc, Mutex, OnceLock},
 	time::Duration,
 };
 
 use hickory_resolver::{
-	config::{NameServerConfigGroup, ResolverConfig, ResolverOpts},
-	name_server::TokioConnectionProvider,
 	TokioResolver,
+	config::{
+		ConnectionConfig, LookupIpStrategy, NameServerConfig, ResolverConfig,
+		ResolverOpts,
+	},
+	net::runtime::TokioRuntimeProvider,
 };
 use tokio::{
 	io::{AsyncReadExt, AsyncWriteExt},
@@ -16,6 +21,11 @@ use tokio::{
 };
 
 use crate::error::QosNetError;
+
+type ResolverKey = (Vec<IpAddr>, u16);
+
+static RESOLVERS: OnceLock<Mutex<HashMap<ResolverKey, Arc<TokioResolver>>>> =
+	OnceLock::new();
 
 /// Struct representing a TCP connection held on our proxy
 pub struct ProxyConnection {
@@ -116,29 +126,7 @@ pub async fn resolve_hostname(
 		})
 		.collect::<Result<Vec<IpAddr>, AddrParseError>>()?;
 
-	let resolver_config = ResolverConfig::from_parts(
-		None,
-		vec![],
-		NameServerConfigGroup::from_ips_clear(
-			&resolver_parsed_addrs,
-			port,
-			true,
-		),
-	);
-
-	// ensure the resolve call will be < 5s for our socket timeout (so we return a meaningful error and don't hog the socket)
-	// this means attempts * timeout < 5s
-	let mut resolver_opts = ResolverOpts::default();
-	resolver_opts.timeout = Duration::from_secs(1);
-	resolver_opts.attempts = 1;
-
-	let resolver = TokioResolver::builder_with_config(
-		resolver_config,
-		TokioConnectionProvider::default(),
-	)
-	.with_options(resolver_opts)
-	.build();
-
+	let resolver = cached_resolver(resolver_parsed_addrs, port)?;
 	let response =
 		resolver.lookup_ip(&hostname).await.map_err(QosNetError::from)?;
 	response.iter().next().ok_or_else(|| {
@@ -146,6 +134,77 @@ pub async fn resolve_hostname(
 			"Empty response when querying for host {hostname}"
 		))
 	})
+}
+
+fn resolver_cache() -> &'static Mutex<HashMap<ResolverKey, Arc<TokioResolver>>>
+{
+	RESOLVERS.get_or_init(Default::default)
+}
+
+fn cached_resolver(
+	resolver_parsed_addrs: Vec<IpAddr>,
+	port: u16,
+) -> Result<Arc<TokioResolver>, QosNetError> {
+	let key = (resolver_parsed_addrs, port);
+	if let Some(resolver) = resolver_cache()
+		.lock()
+		.map_err(|_| {
+			QosNetError::DNSResolutionError(
+				"Resolver cache lock poisoned".to_string(),
+			)
+		})?
+		.get(&key)
+		.cloned()
+	{
+		return Ok(resolver);
+	}
+
+	let resolver = Arc::new(build_resolver(&key.0, key.1)?);
+	let mut resolvers = resolver_cache().lock().map_err(|_| {
+		QosNetError::DNSResolutionError(
+			"Resolver cache lock poisoned".to_string(),
+		)
+	})?;
+	Ok(resolvers.entry(key).or_insert(resolver).clone())
+}
+
+fn build_resolver(
+	resolver_parsed_addrs: &[IpAddr],
+	port: u16,
+) -> Result<TokioResolver, QosNetError> {
+	let name_servers = resolver_parsed_addrs
+		.iter()
+		.copied()
+		.map(|ip| {
+			let mut udp = ConnectionConfig::udp();
+			udp.port = port;
+			let mut tcp = ConnectionConfig::tcp();
+			tcp.port = port;
+
+			NameServerConfig::new(ip, true, vec![udp, tcp])
+		})
+		.collect();
+
+	let resolver_config =
+		ResolverConfig::from_parts(None, vec![], name_servers);
+
+	let mut resolver_opts = ResolverOpts::default();
+	// Keep attempts * timeout below the proxy socket budget.
+	resolver_opts.timeout = Duration::from_secs(1);
+	resolver_opts.attempts = 1;
+	// Clamp long-lived records so cached answers do not stay stale too long.
+	resolver_opts.positive_max_ttl = Some(Duration::from_secs(300));
+	// Currently we only check the first address and downstream code assumes its Ipv4;
+	// this setting ensures that the resolver always resolves an Ipv4 address first.
+	resolver_opts.ip_strategy = LookupIpStrategy::Ipv4thenIpv6;
+
+	TokioResolver::builder_with_config(
+		resolver_config,
+		TokioRuntimeProvider::default(),
+	)
+	.with_options(resolver_opts)
+	.build()
+	.map_err(QosNetError::from)
 }
 
 #[cfg(test)]
@@ -159,6 +218,7 @@ mod test {
 	use super::*;
 
 	#[tokio::test]
+	#[ignore = "requires external network"]
 	async fn can_fetch_tls_content_with_proxy_connection() {
 		let host = "api.turnkey.com";
 		let path = "/health";
@@ -177,7 +237,12 @@ mod test {
 
 		let server_name: rustls::pki_types::ServerName<'_> =
 			host.try_into().unwrap();
-		let config: rustls::ClientConfig = rustls::ClientConfig::builder()
+		let config: rustls::ClientConfig =
+			rustls::ClientConfig::builder_with_provider(Arc::new(
+				rustls::crypto::aws_lc_rs::default_provider(),
+			))
+			.with_safe_default_protocol_versions()
+			.unwrap()
 			.with_root_certificates(root_store)
 			.with_no_client_auth();
 		let conn = TlsConnector::from(Arc::new(config));
@@ -203,5 +268,35 @@ mod test {
 		let response_text = std::str::from_utf8(&response_bytes).unwrap();
 		assert!(response_text.contains("HTTP/1.1 200 OK"));
 		assert!(response_text.contains("currentTime"));
+	}
+
+	#[tokio::test]
+	async fn invalid_dns_resolver_address_returns_parse_error() {
+		let err = resolve_hostname(
+			"api.turnkey.com".to_string(),
+			vec!["not-an-ip-address".to_string()],
+			53,
+		)
+		.await
+		.unwrap_err();
+
+		assert!(matches!(err, QosNetError::ParseError(_)));
+	}
+
+	#[test]
+	fn cached_resolver_reuses_resolver_for_same_dns_config() {
+		let resolver_addrs = vec!["127.0.0.1".parse().unwrap()];
+		let first = cached_resolver(resolver_addrs.clone(), 53).unwrap();
+		let second = cached_resolver(resolver_addrs.clone(), 53).unwrap();
+		let different_port = cached_resolver(resolver_addrs, 54).unwrap();
+
+		assert!(Arc::ptr_eq(&first, &second));
+		assert!(!Arc::ptr_eq(&first, &different_port));
+
+		let opts = first.options();
+		assert_eq!(opts.timeout, Duration::from_secs(1));
+		assert_eq!(opts.attempts, 1);
+		assert_eq!(opts.positive_max_ttl, Some(Duration::from_secs(300)));
+		assert_eq!(opts.ip_strategy, LookupIpStrategy::Ipv4thenIpv6);
 	}
 }

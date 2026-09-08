@@ -11,16 +11,16 @@ use std::{
 use borsh::BorshDeserialize;
 use integration::{LOCAL_HOST, PCR3_PRE_IMAGE_PATH, QOS_DIST_DIR};
 use qos_core::protocol::{
+	ProtocolPhase,
 	services::{
-		boot::{Approval, Manifest, ManifestSet, Namespace, ShareSet},
+		boot::{Approval, ManifestSet, Namespace, ShareSet, VersionedManifest},
 		genesis::{GenesisMemberOutput, GenesisOutput},
 	},
-	ProtocolPhase, QosHash,
 };
 use qos_crypto::sha_256;
 use qos_host::EnclaveInfo;
 use qos_p256::P256Pair;
-use qos_test_primitives::{ChildWrapper, PathWrapper};
+use qos_test_primitives::PathWrapper;
 
 #[tokio::main]
 async fn main() {
@@ -33,12 +33,6 @@ async fn main() {
 	let tmp = PathWrapper::from("/tmp/enclave-example");
 	let _ = PathWrapper::from(PIVOT_HASH_PATH);
 	fs::create_dir_all(&tmp).unwrap();
-
-	let usock = tmp.join("example.sock");
-	let secret_path = tmp.join("example.secret");
-	let pivot_path = tmp.join("example.pivot");
-	let manifest_path = tmp.join("example.manifest");
-	let eph_path = tmp.join("ephemeral_key.secret");
 
 	let boot_dir = PathWrapper::from("boot-dir");
 	fs::create_dir_all(&boot_dir).unwrap();
@@ -65,13 +59,15 @@ async fn main() {
 
 	// -- CLIENT create manifest.
 	let pivot_args = std::env::args().nth(2).expect("No pivot args provided");
-	let pivot_env = "pivot_env_var=will be set";
 	let cli_manifest_path = boot_dir.join("manifest");
 	let app_host_port = 3000;
 
-	assert!(Command::new(integration::QOS_CLIENT_PATH)
+	assert!(
+		Command::new(integration::QOS_CLIENT_PATH)
 		.args([
 			"generate-manifest",
+			"--use-manifest-version",
+			"2",
 			"--nonce",
 			"2",
 			"--namespace",
@@ -88,18 +84,18 @@ async fn main() {
 			cli_manifest_path.to_str().unwrap(),
 			"--pivot-args",
 			&pivot_args,
-			"--pivot-env",
-			pivot_env,
 			"--manifest-set-dir",
 			"./mock/keys/manifest-set",
 			"--share-set-dir",
 			"./mock/keys/share-set",
-			"--patch-set-dir",
-			"./mock/keys/manifest-set",
 			"--quorum-key-path",
 			"./mock/namespaces/quit-coding-to-vape/quorum_key.pub",
+			"--debug-mode",
+			"true",
 			"--bridge-config",
-			&format!("[{{\"type\": \"server\", \"port\": {app_host_port}, \"host\": \"0.0.0.0\"}}]"),
+			&format!("[{{\"type\": \"server\", \"port\": {app_host_port}, \"host\": \"0.0.0.0\"}},{{\"type\": \"client\", \"port\": 0}}]"),
+			"--dns-resolvers",
+			"[8.8.4.4]",
 		])
 		.spawn()
 		.unwrap()
@@ -108,7 +104,7 @@ async fn main() {
 		.success());
 
 	// Check the manifest written to file
-	let manifest: Manifest =
+	let manifest: VersionedManifest =
 		serde_json::from_slice(&fs::read(&cli_manifest_path).unwrap()).unwrap();
 
 	let genesis_output = {
@@ -132,17 +128,19 @@ async fn main() {
 		nonce: 2,
 		quorum_key: genesis_output.quorum_key,
 	};
-	assert_eq!(manifest.namespace, namespace_field);
+	assert_eq!(*manifest.namespace(), namespace_field);
 	let manifest_set = ManifestSet { threshold: 2, members: members.clone() };
-	assert_eq!(manifest.manifest_set, manifest_set);
+	assert_eq!(*manifest.manifest_set(), manifest_set);
 	let share_set = ShareSet { threshold: 2, members };
-	assert_eq!(manifest.share_set, share_set);
+	assert_eq!(*manifest.share_set(), share_set);
 
 	// -- CLIENT make sure each user can run `approve-manifest`
 	for alias in [user1, user2, user3] {
 		let approval_path = boot_dir.join(format!(
 			"{}-{}-{}.approval",
-			alias, namespace, manifest.namespace.nonce,
+			alias,
+			namespace,
+			manifest.namespace().nonce,
 		));
 
 		let secret_path = personal_dir(alias).join(format!("{alias}.secret"));
@@ -166,8 +164,6 @@ async fn main() {
 				"./mock/keys/manifest-set",
 				"--share-set-dir",
 				"./mock/keys/share-set",
-				"--patch-set-dir",
-				"./mock/keys/manifest-set",
 				"--quorum-key-path",
 				"./mock/namespaces/quit-coding-to-vape/quorum_key.pub",
 				"--alias",
@@ -185,6 +181,12 @@ async fn main() {
 			let stdout_reader = BufReader::new(stdout);
 			stdout_reader.lines()
 		};
+
+		assert_eq!(
+			&stdout.next().unwrap().unwrap(),
+			"Is this the correct manifest schema version: v2? (y/n)"
+		);
+		stdin.write_all("y\n".as_bytes()).expect("Failed to write to stdin");
 
 		assert_eq!(
 			&stdout.next().unwrap().unwrap(),
@@ -224,12 +226,23 @@ async fn main() {
 
 		assert_eq!(
 			&stdout.next().unwrap().unwrap(),
-			"Are these the correct pivot env vars:"
+			"Is this the correct pivot debug mode: true? (y/n)"
 		);
+		stdin.write_all("y\n".as_bytes()).expect("Failed to write to stdin");
+
 		assert_eq!(
 			&stdout.next().unwrap().unwrap(),
-			"{\"pivot_env_var\": Plain { value: \"will be set\" }}?"
+			"Is this the correct pivot bridge configuration:"
 		);
+		stdout.next().unwrap().unwrap(); // bridge config confirm msg
+		assert_eq!(&stdout.next().unwrap().unwrap(), "(y/n)");
+		stdin.write_all("y\n".as_bytes()).expect("Failed to write to stdin");
+
+		assert_eq!(
+			&stdout.next().unwrap().unwrap(),
+			"Are these the correct DNS resolvers:"
+		);
+		assert_eq!(&stdout.next().unwrap().unwrap(), "[8.8.4.4]?");
 		assert_eq!(&stdout.next().unwrap().unwrap(), "(y/n)");
 		stdin.write_all("y\n".as_bytes()).expect("Failed to write to stdin");
 
@@ -244,7 +257,7 @@ async fn main() {
 		)
 		.unwrap();
 
-		let signature = personal_pair.sign(&manifest.qos_hash()).unwrap();
+		let signature = personal_pair.sign(&manifest.manifest_hash()).unwrap();
 		assert_eq!(approval.signature, signature);
 
 		assert_eq!(approval.member.alias, alias);
@@ -254,101 +267,69 @@ async fn main() {
 		);
 	}
 
-	// -- ENCLAVE start enclave
-	let mut _enclave_child_process: ChildWrapper =
-		Command::new(integration::QOS_CORE_PATH)
-			.args([
-				"--usock",
-				usock.to_str().unwrap(),
-				"--quorum-file",
-				secret_path.to_str().unwrap(),
-				"--pivot-file",
-				pivot_path.to_str().unwrap(),
-				"--ephemeral-file",
-				eph_path.to_str().unwrap(),
-				"--mock",
-				"--manifest-file",
-				manifest_path.to_str().unwrap(),
-			])
-			.spawn()
-			.unwrap()
-			.into();
-
-	// -- HOST start host
-	let mut _host_child_process: ChildWrapper =
-		Command::new(integration::QOS_HOST_PATH)
-			.args([
-				"--host-port",
-				&host_port.to_string(),
-				"--host-ip",
-				LOCAL_HOST,
-				"--usock",
-				usock.to_str().unwrap(),
-			])
-			.spawn()
-			.unwrap()
-			.into();
-
-	// -- Make sure the enclave and host have time to boot
-	qos_test_primitives::wait_until_port_is_bound(host_port);
-
 	// -- CLIENT generate the manifest envelope
-	assert!(Command::new(integration::QOS_CLIENT_PATH)
-		.args([
-			"generate-manifest-envelope",
-			"--manifest-approvals-dir",
-			boot_dir.to_str().unwrap(),
-			"--manifest-path",
-			cli_manifest_path.to_str().unwrap(),
-		])
-		.spawn()
-		.unwrap()
-		.wait()
-		.unwrap()
-		.success());
-
-	// -- CLIENT broadcast boot standard instruction
-	let manifest_envelope_path = boot_dir.join("manifest_envelope");
-	assert!(Command::new(integration::QOS_CLIENT_PATH)
-		.args([
-			"boot-standard",
-			"--manifest-envelope-path",
-			manifest_envelope_path.to_str().unwrap(),
-			"--pivot-path",
-			&pivot_file_path,
-			"--host-port",
-			&host_port.to_string(),
-			"--host-ip",
-			LOCAL_HOST,
-			"--pcr3-preimage-path",
-			"./mock/pcr3-preimage.txt",
-			"--unsafe-skip-attestation",
-		])
-		.spawn()
-		.unwrap()
-		.wait()
-		.unwrap()
-		.success());
-
-	for user in [&user1, &user2] {
-		// Get attestation doc and manifest
-		assert!(Command::new(integration::QOS_CLIENT_PATH)
+	assert!(
+		Command::new(integration::QOS_CLIENT_PATH)
 			.args([
-				"get-attestation-doc",
-				"--host-port",
-				&host_port.to_string(),
-				"--host-ip",
-				LOCAL_HOST,
-				"--attestation-doc-path",
-				attestation_doc_path.to_str().unwrap(),
-				"--manifest-envelope-path",
-				"/tmp/dont_care"
+				"generate-manifest-envelope",
+				"--manifest-approvals-dir",
+				boot_dir.to_str().unwrap(),
+				"--manifest-path",
+				cli_manifest_path.to_str().unwrap(),
 			])
 			.spawn()
 			.unwrap()
 			.wait()
 			.unwrap()
-			.success());
+			.success()
+	);
+
+	// -- CLIENT broadcast boot standard instruction
+	let manifest_envelope_path = boot_dir.join("manifest_envelope");
+	assert!(
+		Command::new(integration::QOS_CLIENT_PATH)
+			.args([
+				"boot-standard",
+				"--manifest-envelope-path",
+				manifest_envelope_path.to_str().unwrap(),
+				"--pivot-path",
+				&pivot_file_path,
+				"--host-port",
+				&host_port.to_string(),
+				"--host-ip",
+				LOCAL_HOST,
+				"--pcr3-preimage-path",
+				"./mock/pcr3-preimage.txt",
+				"--unsafe-skip-attestation",
+			])
+			.spawn()
+			.unwrap()
+			.wait()
+			.unwrap()
+			.success()
+	);
+
+	for user in [&user1, &user2] {
+		// Get attestation doc and manifest
+		assert!(
+			Command::new(integration::QOS_CLIENT_PATH)
+				.args([
+					"get-attestation-doc",
+					"--host-port",
+					&host_port.to_string(),
+					"--host-ip",
+					LOCAL_HOST,
+					"--attestation-doc-path",
+					attestation_doc_path.to_str().unwrap(),
+					"--manifest-envelope-path",
+					"/tmp/dont_care"
+				])
+				.spawn()
+				.unwrap()
+				.wait()
+				.unwrap()
+				.success()
+		);
 
 		let share_path = personal_dir(user).join(format!("{user}.share"));
 		let secret_path = personal_dir(user).join(format!("{user}.secret"));
@@ -379,8 +360,6 @@ async fn main() {
 				"--alias",
 				user,
 				"--unsafe-skip-attestation",
-				"--unsafe-eph-path-override",
-				eph_path.to_str().unwrap(),
 			])
 			.stdin(Stdio::piped())
 			.stdout(Stdio::piped())
@@ -412,9 +391,9 @@ async fn main() {
 		stdin.write_all("yes\n".as_bytes()).expect("Failed to write to stdin");
 
 		assert_eq!(
-				&stdout.next().unwrap().unwrap(),
-				"Does this AWS IAM role belong to the intended organization: arn:aws:iam::123456789012:role/Webserver? (y/n)"
-			);
+			&stdout.next().unwrap().unwrap(),
+			"Does this AWS IAM role belong to the intended organization: arn:aws:iam::123456789012:role/Webserver? (y/n)"
+		);
 		stdin.write_all("yes\n".as_bytes()).expect("Failed to write to stdin");
 
 		assert_eq!(
@@ -427,23 +406,25 @@ async fn main() {
 		assert!(child.wait().unwrap().success());
 
 		// Post the encrypted share
-		assert!(Command::new(integration::QOS_CLIENT_PATH)
-			.args([
-				"post-share",
-				"--host-port",
-				&host_port.to_string(),
-				"--host-ip",
-				LOCAL_HOST,
-				"--eph-wrapped-share-path",
-				eph_wrapped_share_path.to_str().unwrap(),
-				"--approval-path",
-				approval_path.to_str().unwrap(),
-			])
-			.spawn()
-			.unwrap()
-			.wait()
-			.unwrap()
-			.success());
+		assert!(
+			Command::new(integration::QOS_CLIENT_PATH)
+				.args([
+					"post-share",
+					"--host-port",
+					&host_port.to_string(),
+					"--host-ip",
+					LOCAL_HOST,
+					"--eph-wrapped-share-path",
+					eph_wrapped_share_path.to_str().unwrap(),
+					"--approval-path",
+					approval_path.to_str().unwrap(),
+				])
+				.spawn()
+				.unwrap()
+				.wait()
+				.unwrap()
+				.success()
+		);
 	}
 
 	// Give the enclave time to start the pivot
@@ -456,10 +437,4 @@ async fn main() {
 	assert_eq!(enclave_info.phase, ProtocolPhase::QuorumKeyProvisioned);
 
 	println!("=========ENCLAVE READY WITH PIVOT RUNNING!!==========");
-	println!("press ctrl+c to quit");
-
-	match tokio::signal::ctrl_c().await {
-		Ok(()) => {}
-		Err(err) => panic!("{err}"),
-	}
 }
