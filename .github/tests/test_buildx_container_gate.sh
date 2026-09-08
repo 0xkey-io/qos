@@ -31,40 +31,55 @@ if [[ "$1 $2" == "buildx inspect" ]]; then
   exit 67
 elif [[ "$1 $2" == "buildx ls" ]]; then
   [[ "${3:-}" == '--format' ]] || exit 68
-  [[ "$*" == *'.Builder.Name'* ]] || exit 69
-  [[ "$*" == *'.Name'* ]] || exit 70
-  [[ "$*" == *'.DriverEndpoint'* ]] || exit 71
-  [[ "$*" == *'.Status'* ]] || exit 72
-  printf 'other-builder\tother-builder\tdocker-container\t\n'
-  printf 'other-builder\tother-node\tother-context\trunning\n'
+  format="${4:-}"
+  if [[ "$format" == *'\t'* || "$format" == *'\n'* ]]; then
+    echo 'template parsing error: unterminated quoted string' >&2
+    exit 69
+  fi
+  [[ "$format" == '{{.Builder.Name}}|{{.Name}}|{{.DriverEndpoint}}|{{.Status}}' ]] || exit 70
+  printf 'default|default||error\n'
+  printf 'other-builder|other-builder|docker-container|\n'
+  printf 'other-builder|other-node|other-context|running\n'
   case "${MOCK_SCENARIO}" in
     zero-builder) exit 0 ;;
     multi-builder)
-      printf 'qos-123-1\tqos-123-1\tdocker-container\t\n'
-      printf 'qos-123-1\tqos-123-1\tdocker-container\t\n'
-      printf 'qos-123-1\tqos-123-1\tqos-validation\trunning\n'
+      printf 'qos-123-1|qos-123-1|docker-container|\n'
+      printf 'qos-123-1|qos-123-1|docker-container|\n'
+      printf 'qos-123-1|qos-123-1|qos-validation|running\n'
       ;;
-    zero-node) printf 'qos-123-1\tqos-123-1\tdocker-container\t\n' ;;
+    zero-node) printf 'qos-123-1|qos-123-1|docker-container|\n' ;;
     multi-node)
-      printf 'qos-123-1\tqos-123-1\tdocker-container\t\n'
-      printf 'qos-123-1\tqos-123-1\tqos-validation\trunning\n'
-      printf 'qos-123-1\tqos-123-1-other\tqos-validation\trunning\n'
+      printf 'qos-123-1|qos-123-1|docker-container|\n'
+      printf 'qos-123-1|qos-123-1|qos-validation|running\n'
+      printf 'qos-123-1|qos-123-1-other|qos-validation|running\n'
       ;;
     wrong-endpoint)
-      printf 'qos-123-1\tqos-123-1\tdocker-container\t\n'
-      printf 'qos-123-1\tqos-123-1\tdefault\trunning\n'
+      printf 'qos-123-1|qos-123-1|docker-container|\n'
+      printf 'qos-123-1|qos-123-1|default|running\n'
       ;;
     wrong-node)
-      printf 'qos-123-1\tqos-123-1\tdocker-container\t\n'
-      printf 'qos-123-1\tother-node\tqos-validation\trunning\n'
+      printf 'qos-123-1|qos-123-1|docker-container|\n'
+      printf 'qos-123-1|other-node|qos-validation|running\n'
       ;;
     stopped)
-      printf 'qos-123-1\tqos-123-1\tdocker-container\t\n'
-      printf 'qos-123-1\tqos-123-1\tqos-validation\tstopped\n'
+      printf 'qos-123-1|qos-123-1|docker-container|\n'
+      printf 'qos-123-1|qos-123-1|qos-validation|stopped\n'
+      ;;
+    extra-field)
+      printf 'qos-123-1|qos-123-1|docker-container|\n'
+      printf 'qos-123-1|qos-123-1|qos-validation|running|unexpected\n'
+      ;;
+    header-trailing-empty-field)
+      printf 'qos-123-1|qos-123-1|docker-container||\n'
+      printf 'qos-123-1|qos-123-1|qos-validation|running\n'
+      ;;
+    node-trailing-empty-field)
+      printf 'qos-123-1|qos-123-1|docker-container|\n'
+      printf 'qos-123-1|qos-123-1|qos-validation|running|\n'
       ;;
     *)
-      printf 'qos-123-1\tqos-123-1\tdocker-container\t\n'
-      printf 'qos-123-1\tqos-123-1\tqos-validation\trunning\n'
+      printf 'qos-123-1|qos-123-1|docker-container|\n'
+      printf 'qos-123-1|qos-123-1|qos-validation|running\n'
       ;;
   esac
 elif [[ "$1" == "inspect" ]]; then
@@ -105,6 +120,9 @@ assert_fails 'expected exactly one Buildx node, found 0' run_gate zero-node
 assert_fails 'expected exactly one Buildx node, found 2' run_gate multi-node
 assert_fails 'unexpected Buildx node name' run_gate wrong-node
 assert_fails 'unexpected Buildx endpoint' run_gate wrong-endpoint
+assert_fails 'Buildx list record has unexpected fields' run_gate extra-field
+assert_fails 'Buildx list record has unexpected fields' run_gate node-trailing-empty-field
+assert_fails 'Buildx list record has unexpected fields' run_gate header-trailing-empty-field
 assert_fails 'expected exactly one BuildKit container record, found 2' run_gate multi-container
 assert_fails 'Buildx node is not running' run_gate stopped
 assert_fails 'BuildKit container is not running' run_gate container-stopped
@@ -116,4 +134,4 @@ assert_fails 'builder must use safe name characters' env \
   "$entry" 'bad/builder' qos-123-1 qos-validation
 [[ ! -s "${tmp}/docker.log" ]] || fail 'malformed builder reached Docker'
 
-echo '11 Buildx container gate behavior tests passed'
+echo '14 Buildx container gate behavior tests passed'
