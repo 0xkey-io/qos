@@ -54,9 +54,9 @@ pub const PIVOT_SOCKET_STRESS_PATH: &str = concat!(
 /// Path to an enclave app that has routes to fetch app proofs.
 pub const PIVOT_PROOF_PATH: &str =
 	concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/debug/pivot_proof");
-/// Path to `qos_bridge` bin for tests.
+/// Path to `qos_bridge` ingress bin for tests.
 pub const QOS_BRIDGE_PATH: &str =
-	concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/debug/qos_bridge");
+	concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/debug/ingress");
 /// Path to `qos_client` bin for tests.
 pub const QOS_CLIENT_PATH: &str =
 	concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/debug/qos_client");
@@ -166,13 +166,13 @@ pub async fn wait_for_usock<P: AsRef<Path>>(path: P) {
 	for _ in 0..50 {
 		if std::fs::exists(path).unwrap() && client.try_connect().await.is_ok()
 		{
-			break;
+			return;
 		}
 
 		tokio::time::sleep(Duration::from_millis(100)).await;
 	}
 
-	eprintln!("warning: no usock found at path: {}", path.display())
+	panic!("unable to connect to usock at path: {}", path.display())
 }
 
 pub async fn wait_for_tcp_sock<Addr>(host_addr: &Addr)

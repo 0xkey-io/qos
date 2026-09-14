@@ -8,7 +8,9 @@ use std::{
 
 use qos_p256::P256Pair;
 
-use crate::protocol::{services::boot::ManifestEnvelope, ProtocolError};
+use crate::protocol::{
+	ProtocolError, services::boot::VersionedManifestEnvelope,
+};
 
 /// Handle for accessing the quorum key.
 #[derive(Debug, Clone)]
@@ -182,11 +184,12 @@ impl Handles {
 	/// Errors if the Manifest has not been put.
 	pub fn get_manifest_envelope(
 		&self,
-	) -> Result<ManifestEnvelope, ProtocolError> {
+	) -> Result<VersionedManifestEnvelope, ProtocolError> {
 		let contents = fs::read(&self.manifest)
 			.map_err(|_| ProtocolError::FailedToGetManifestEnvelope)?;
-		let manifest = serde_json::from_slice(&contents)
-			.map_err(|_| ProtocolError::FailedToGetManifestEnvelope)?;
+		let manifest =
+			VersionedManifestEnvelope::try_from_slice_compat(&contents)
+				.map_err(|_| ProtocolError::FailedToGetManifestEnvelope)?;
 
 		Ok(manifest)
 	}
@@ -196,13 +199,18 @@ impl Handles {
 	/// # Errors
 	///
 	/// Errors if the Manifest has already been put.
-	pub fn put_manifest_envelope(
+	pub fn put_manifest_envelope<E>(
 		&self,
-		manifest_envelope: &ManifestEnvelope,
-	) -> Result<(), ProtocolError> {
+		manifest_envelope: E,
+	) -> Result<(), ProtocolError>
+	where
+		E: Into<VersionedManifestEnvelope>,
+	{
+		let manifest_envelope = manifest_envelope.into();
 		Self::write_as_read_only(
 			&self.manifest,
-			&serde_json::to_vec(manifest_envelope)
+			&manifest_envelope
+				.to_storage_vec()
 				.map_err(|_| ProtocolError::FailedToPutManifestEnvelope)?,
 			ProtocolError::FailedToPutManifestEnvelope,
 		)
@@ -213,7 +221,7 @@ impl Handles {
 	/// **Warning**: This should not be used after pivoting. It is only meant to
 	/// be used when updating the manifest envelope while provisioning.
 	pub(crate) fn mutate_manifest_envelope<
-		F: FnOnce(ManifestEnvelope) -> ManifestEnvelope,
+		F: FnOnce(VersionedManifestEnvelope) -> VersionedManifestEnvelope,
 	>(
 		&self,
 		mutate: F,
@@ -229,7 +237,8 @@ impl Handles {
 		)?;
 		fs::write(
 			&self.manifest,
-			serde_json::to_vec(&manifest_envelope)
+			manifest_envelope
+				.to_storage_vec()
 				.map_err(|_| ProtocolError::FailedToPutManifestEnvelope)?,
 		)
 		.map_err(|_| ProtocolError::FailedToPutManifestEnvelope)?;
@@ -266,11 +275,11 @@ impl Handles {
 			Err(ProtocolError::CannotModifyPostPivotStatic)?;
 		}
 
-		if let Some(parent) = Path::new(&self.pivot).parent() {
-			if !parent.exists() {
-				fs::create_dir_all(parent)
-					.map_err(|_| ProtocolError::FailedToPutPivot)?;
-			}
+		if let Some(parent) = Path::new(&self.pivot).parent()
+			&& !parent.exists()
+		{
+			fs::create_dir_all(parent)
+				.map_err(|_| ProtocolError::FailedToPutPivot)?;
 		}
 
 		fs::write(&self.pivot, pivot)
@@ -299,10 +308,10 @@ impl Handles {
 			Err(ProtocolError::CannotModifyPostPivotStatic)?;
 		}
 
-		if let Some(parent) = path.as_ref().parent() {
-			if !parent.exists() {
-				fs::create_dir_all(parent).map_err(|_| err.clone())?;
-			}
+		if let Some(parent) = path.as_ref().parent()
+			&& !parent.exists()
+		{
+			fs::create_dir_all(parent).map_err(|_| err.clone())?;
 		}
 
 		let tmp_path = PathBuf::from(path.as_ref()).with_extension("tmp");
@@ -327,8 +336,8 @@ mod test {
 
 	use super::*;
 	use crate::protocol::services::boot::{
-		Manifest, ManifestSet, Namespace, NitroConfig, PatchSet, PivotConfig,
-		RestartPolicy, ShareSet,
+		Manifest, ManifestEnvelope, ManifestSet, Namespace, NitroConfig,
+		PatchSet, PivotConfig, RestartPolicy, ShareSet,
 	};
 
 	#[test]
@@ -345,10 +354,10 @@ mod test {
 			PathWrapper::from("put_ephemeral_key_is_read_only_write.manifest");
 
 		let handles = Handles::new(
-			ephemeral_file.to_str().map(ToString::to_string).unwrap(),
-			quorum_file.to_str().map(ToString::to_string).unwrap(),
-			manifest_file.to_str().map(ToString::to_string).unwrap(),
-			pivot_file.to_str().map(ToString::to_string).unwrap(),
+			ephemeral_file.display().to_string(),
+			quorum_file.display().to_string(),
+			manifest_file.display().to_string(),
+			pivot_file.display().to_string(),
 		);
 
 		let ephemeral_key = P256Pair::generate().unwrap();
@@ -372,10 +381,10 @@ mod test {
 			PathWrapper::from("put_quorum_key_is_read_only_write.manifest");
 
 		let handles = Handles::new(
-			ephemeral_file.to_str().map(ToString::to_string).unwrap(),
-			quorum_file.to_str().map(ToString::to_string).unwrap(),
-			manifest_file.to_str().map(ToString::to_string).unwrap(),
-			pivot_file.to_str().map(ToString::to_string).unwrap(),
+			ephemeral_file.display().to_string(),
+			quorum_file.display().to_string(),
+			manifest_file.display().to_string(),
+			pivot_file.display().to_string(),
 		);
 
 		let quorum_key = P256Pair::generate().unwrap();
@@ -401,10 +410,10 @@ mod test {
 			PathWrapper::from("put_pivot_is_read_only_write.manifest");
 
 		let handles = Handles::new(
-			ephemeral_file.to_str().map(ToString::to_string).unwrap(),
-			quorum_file.to_str().map(ToString::to_string).unwrap(),
-			manifest_file.to_str().map(ToString::to_string).unwrap(),
-			pivot_file.to_str().map(ToString::to_string).unwrap(),
+			ephemeral_file.display().to_string(),
+			quorum_file.display().to_string(),
+			manifest_file.display().to_string(),
+			pivot_file.display().to_string(),
 		);
 
 		let pivot = b"this is a pivot binary".to_vec();
@@ -428,10 +437,10 @@ mod test {
 			PathWrapper::from("put_manifest_is_read_only_write.manifest");
 
 		let handles = Handles::new(
-			ephemeral_file.to_str().map(ToString::to_string).unwrap(),
-			quorum_file.to_str().map(ToString::to_string).unwrap(),
-			manifest_file.to_str().map(ToString::to_string).unwrap(),
-			pivot_file.to_str().map(ToString::to_string).unwrap(),
+			ephemeral_file.display().to_string(),
+			quorum_file.display().to_string(),
+			manifest_file.display().to_string(),
+			pivot_file.display().to_string(),
 		);
 
 		let pivot = b"this is a pivot binary".to_vec();
@@ -464,11 +473,12 @@ mod test {
 			patch_set: PatchSet::default(),
 		};
 
-		let manifest_envelope = ManifestEnvelope {
-			manifest,
-			manifest_set_approvals: vec![],
-			share_set_approvals: vec![],
-		};
+		let manifest_envelope =
+			VersionedManifestEnvelope::V1(ManifestEnvelope {
+				manifest,
+				manifest_set_approvals: vec![],
+				share_set_approvals: vec![],
+			});
 
 		let result = handles.put_manifest_envelope(&manifest_envelope);
 		let error =
@@ -477,6 +487,6 @@ mod test {
 		assert!(result.is_ok());
 		assert_eq!(error, ProtocolError::CannotModifyPostPivotStatic);
 		assert!(handles.manifest_envelope_exists());
-		assert!(handles.get_manifest_envelope().unwrap() == manifest_envelope);
+		assert_eq!(handles.get_manifest_envelope().unwrap(), manifest_envelope);
 	}
 }

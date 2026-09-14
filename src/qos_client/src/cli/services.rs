@@ -1,31 +1,37 @@
 use std::{
 	fs::{self, File},
-	io::{self, BufRead, BufReader, Write},
+	io::{self, BufRead, Read, Write},
 	mem,
+	net::IpAddr,
 	path::{Path, PathBuf},
 };
 
 use aws_nitro_enclaves_nsm_api::api::AttestationDoc;
 use borsh::BorshDeserialize;
 use qos_core::protocol::{
-	msg::ProtocolMsg,
+	QosHash,
+	msg::{JsonBytes, ProtocolMsg, ProtocolMsgEncoding},
 	services::{
 		boot::{
-			Approval, BridgeConfig, Manifest, ManifestEnvelope, ManifestSet,
-			MemberPubKey, Namespace, NitroConfig, PatchSet, PivotConfig,
-			QuorumMember, RestartPolicy, ShareSet,
+			Approval, BridgeConfig, DnsConfig, Manifest as ManifestV1,
+			ManifestBuilder, ManifestBuilderError,
+			ManifestEnvelope as ManifestEnvelopeV1, ManifestEnvelopeV0,
+			ManifestEnvelopeV2, ManifestSet, ManifestVersion, MemberPubKey,
+			Namespace, NitroConfig, PatchSet, PivotConfig as PivotConfigV1,
+			QuorumMember, RestartPolicy, ShareSet, VersionedManifest,
+			VersionedManifestEnvelope,
 		},
 		genesis::{GenesisOutput, GenesisSet},
 		key::EncryptedQuorumKey,
 	},
-	QosHash,
 };
 use qos_crypto::{sha_256, sha_384, sha_512};
 use qos_nsm::{
 	nitro::{
-		attestation_doc_from_der, cert_from_pem,
-		unsafe_attestation_doc_from_der,
-		verify_attestation_doc_against_user_input, AWS_ROOT_CERT_PEM,
+		AWS_ROOT_CERT_PEM, ManifestAttestationInput, attestation_doc_from_der,
+		cert_from_pem, unsafe_attestation_doc_from_der,
+		verify_attestation_doc_against_manifest_setup,
+		verify_attestation_doc_against_user_input,
 	},
 	types::NsmResponse,
 };
@@ -50,11 +56,14 @@ const DANGEROUS_DEV_BOOT_NAMESPACE: &str =
 	"DANGEROUS_DEV_BOOT_MEMBER_NAMESPACE";
 
 #[cfg(not(feature = "smartcard"))]
-pub(crate) const SMARTCARD_FEAT_DISABLED_MSG: &str =
-	"The \"smartcard\" feature must be enabled to use YubiKey related functionality.";
+pub(crate) const SMARTCARD_FEAT_DISABLED_MSG: &str = "The \"smartcard\" feature must be enabled to use YubiKey related functionality.";
 
 const ENTER_PIN_PROMPT: &str = "Enter your pin: ";
 const TAP_MSG: &str = "Tap your YubiKey";
+
+type Manifest = ManifestV1;
+type ManifestEnvelope = ManifestEnvelopeV1;
+type PivotConfig = PivotConfigV1;
 
 /// Client errors.
 #[derive(Debug)]
@@ -143,6 +152,29 @@ pub enum Error {
 	/// Given quorum key seed does not match the hash of the expected quorum
 	/// key seed.
 	SecretDoesNotMatch,
+	/// The genesis output does not match the boot genesis request it is
+	/// supposed to be based on.
+	GenesisOutputDoesNotMatchRequest,
+	/// v2 manifests cannot be represented in borsh.
+	ManifestV2NotConvertibleToBorsh,
+	/// v2 manifests do not support patch sets.
+	ManifestV2DoesNotSupportPatchSet,
+	/// v1/v0 manifests require patch sets.
+	ManifestV1RequiresPatchSet,
+	/// v1/v0 manifests do not support DNS resolver configuration.
+	ManifestV1DoesNotSupportDnsConfig,
+	/// Failed to construct a manifest from the supplied configuration.
+	ManifestBuilder(ManifestBuilderError),
+	/// The manifest schema is not supported by this client operation.
+	UnsupportedManifestVersion,
+	/// The PCR3 derived from the local PCR3 preimage file does not match the
+	/// PCR3 committed to in the manifest.
+	Pcr3PreimageDoesNotMatchManifest {
+		/// Hex encoded PCR3 committed to in the manifest.
+		manifest_pcr3: String,
+		/// Hex encoded PCR3 derived from the local preimage file.
+		file_pcr3: String,
+	},
 }
 
 impl From<serde_json::Error> for Error {
@@ -154,6 +186,12 @@ impl From<serde_json::Error> for Error {
 impl From<borsh::io::Error> for Error {
 	fn from(err: borsh::io::Error) -> Self {
 		Self::Deserialize(err.to_string())
+	}
+}
+
+impl From<ManifestBuilderError> for Error {
+	fn from(err: ManifestBuilderError) -> Self {
+		Self::ManifestBuilder(err)
 	}
 }
 
@@ -187,7 +225,7 @@ impl From<qos_nsm::nitro::AttestError> for Error {
 pub enum PairOrYubi {
 	/// Yubikey
 	#[cfg(feature = "smartcard")]
-	Yubi((yubikey::YubiKey, Vec<u8>)),
+	Yubi((yubikey::YubiKey, Zeroizing<Vec<u8>>)),
 	/// P256 keypair
 	Pair(P256Pair),
 }
@@ -214,10 +252,7 @@ impl PairOrYubi {
 					let pin = if let Some(pin_path) = maybe_pin_path {
 						pin_from_path(pin_path)
 					} else {
-						rpassword::prompt_password(ENTER_PIN_PROMPT)
-							.map_err(Error::PinEntryError)?
-							.as_bytes()
-							.to_vec()
+						prompt_pin()?
 					};
 
 					PairOrYubi::Yubi((yubi, pin))
@@ -248,11 +283,11 @@ impl PairOrYubi {
 	pub fn sign(&mut self, data: &[u8]) -> Result<Vec<u8>, Error> {
 		match self {
 			#[cfg(feature = "smartcard")]
-			Self::Yubi((ref mut yubi, ref pin)) => {
+			Self::Yubi((yubi, pin)) => {
 				println!("{TAP_MSG}");
 				crate::yubikey::sign_data(yubi, data, pin).map_err(Into::into)
 			}
-			Self::Pair(ref pair) => pair.sign(data).map_err(Into::into),
+			Self::Pair(pair) => pair.sign(data).map_err(Into::into),
 		}
 	}
 
@@ -261,10 +296,13 @@ impl PairOrYubi {
 	/// # Errors
 	///
 	/// Returns [`Error`] if decryption fails.
-	pub fn decrypt(&mut self, payload: &[u8]) -> Result<Vec<u8>, Error> {
+	pub fn decrypt(
+		&mut self,
+		payload: &[u8],
+	) -> Result<Zeroizing<Vec<u8>>, Error> {
 		match self {
 			#[cfg(feature = "smartcard")]
-			Self::Yubi((ref mut yubi, ref pin)) => {
+			Self::Yubi((yubi, pin)) => {
 				println!("{TAP_MSG}");
 				let shared_secret =
 					crate::yubikey::shared_secret(yubi, payload, pin)?;
@@ -277,7 +315,7 @@ impl PairOrYubi {
 					.decrypt_from_shared_secret(payload, &shared_secret)
 					.map_err(Into::into)
 			}
-			Self::Pair(ref pair) => pair.decrypt(payload).map_err(Into::into),
+			Self::Pair(pair) => pair.decrypt(payload).map_err(Into::into),
 		}
 	}
 
@@ -289,10 +327,10 @@ impl PairOrYubi {
 	pub fn public_key_bytes(&mut self) -> Result<Vec<u8>, Error> {
 		match self {
 			#[cfg(feature = "smartcard")]
-			Self::Yubi((ref mut yubi, _)) => {
+			Self::Yubi((yubi, _)) => {
 				crate::yubikey::pair_public_key(yubi).map_err(Into::into)
 			}
-			Self::Pair(ref pair) => Ok(pair.public_key().to_bytes()),
+			Self::Pair(pair) => Ok(pair.public_key().to_bytes()),
 		}
 	}
 }
@@ -307,7 +345,7 @@ pub fn generate_file_key<P: AsRef<Path>>(
 		P256Pair::generate().expect("unable to generate P256 keypair");
 
 	// Write the personal key secret
-	write_with_msg(
+	write_secret_with_msg(
 		master_secret_path.as_ref(),
 		&share_key_pair.to_master_seed_hex(),
 		"Master Seed",
@@ -328,10 +366,7 @@ pub(crate) fn provision_yubikey<P: AsRef<Path>>(
 	let mut yubikey =
 		yubikey::YubiKey::open().map_err(Error::OpenSingleYubiKey)?;
 
-	let pin = rpassword::prompt_password(ENTER_PIN_PROMPT)
-		.map_err(Error::PinEntryError)?
-		.as_bytes()
-		.to_vec();
+	let pin = prompt_pin()?;
 
 	let _sign_public_key_bytes = crate::yubikey::generate_signed_certificate(
 		&mut yubikey,
@@ -367,15 +402,28 @@ pub(crate) fn provision_yubikey<P: AsRef<Path>>(
 	Ok(())
 }
 
-pub(crate) fn pin_from_path<P: AsRef<Path>>(path: P) -> Vec<u8> {
-	let file = File::open(path).expect("Failed to open current pin path");
-	BufReader::new(file)
+pub(crate) fn pin_from_path<P: AsRef<Path>>(path: P) -> Zeroizing<Vec<u8>> {
+	let contents = read_secret_utf8(path.as_ref())
+		.expect("Failed to read current pin path as UTF-8");
+	let line = contents
 		.lines()
 		.next()
-		.expect("First line missing from current pin file")
-		.expect("Error reading first line")
-		.as_bytes()
-		.to_vec()
+		.expect("First line missing from current pin file");
+	Zeroizing::new(line.as_bytes().to_vec())
+}
+
+#[cfg(feature = "smartcard")]
+fn prompt_pin() -> Result<Zeroizing<Vec<u8>>, Error> {
+	prompt_pin_with(|prompt| rpassword::prompt_password(prompt))
+}
+
+#[cfg(feature = "smartcard")]
+fn prompt_pin_with<F>(prompt: F) -> Result<Zeroizing<Vec<u8>>, Error>
+where
+	F: FnOnce(&str) -> io::Result<String>,
+{
+	let pin = prompt(ENTER_PIN_PROMPT).map_err(Error::PinEntryError)?;
+	Ok(Zeroizing::new(pin.into_bytes()))
 }
 
 /// Provision a yubikey from a pre-generated master seed.
@@ -395,10 +443,7 @@ pub fn advanced_provision_yubikey<P: AsRef<Path>>(
 	let pin = if let Some(pin_path) = maybe_pin_path {
 		pin_from_path(pin_path)
 	} else {
-		rpassword::prompt_password(ENTER_PIN_PROMPT)
-			.map_err(Error::PinEntryError)?
-			.as_bytes()
-			.to_vec()
+		prompt_pin()?
 	};
 
 	let pair = P256Pair::from_hex_file(master_seed_path)?;
@@ -413,7 +458,7 @@ pub fn advanced_provision_yubikey<P: AsRef<Path>>(
 
 	crate::yubikey::import_key_and_generate_signed_certificate(
 		&mut yubikey,
-		&sign_secret,
+		&sign_secret[..],
 		crate::yubikey::SIGNING_SLOT,
 		&pin,
 		yubikey::MgmKey::default(),
@@ -423,7 +468,7 @@ pub fn advanced_provision_yubikey<P: AsRef<Path>>(
 
 	crate::yubikey::import_key_and_generate_signed_certificate(
 		&mut yubikey,
-		&encrypt_secret,
+		&encrypt_secret[..],
 		crate::yubikey::KEY_AGREEMENT_SLOT,
 		&pin,
 		yubikey::MgmKey::default(),
@@ -473,15 +518,25 @@ pub(crate) fn boot_genesis<P: AsRef<Path>>(
 		None
 	};
 
-	let req =
-		ProtocolMsg::BootGenesisRequest { set: genesis_set.clone(), dr_key };
-	let (cose_sign1, genesis_output) = match request::post(uri, &req).unwrap() {
-		ProtocolMsg::BootGenesisResponse {
-			nsm_response: NsmResponse::Attestation { document },
-			genesis_output,
-		} => (document, genesis_output),
-		r => panic!("Unexpected response: {r:?}"),
+	let req = ProtocolMsg::BootGenesisRequest {
+		set: genesis_set.clone(),
+		dr_key: dr_key.clone(),
 	};
+	// Genesis is only supported on the canonical JSON wire encoding; there is
+	// intentionally no legacy Borsh fallback here.
+	let (cose_sign1, genesis_output) =
+		match request::post_json(uri, &req).unwrap() {
+			ProtocolMsg::BootGenesisResponse {
+				nsm_response: NsmResponse::Attestation { document },
+				genesis_output,
+			} => (document, genesis_output),
+			r => panic!("Unexpected response: {r:?}"),
+		};
+	validate_genesis_output_matches_request(
+		&genesis_output,
+		&genesis_set,
+		dr_key.as_deref(),
+	)?;
 	let quorum_key =
 		P256Public::from_bytes(&genesis_output.quorum_key).unwrap();
 	let attestation_doc =
@@ -573,6 +628,19 @@ pub(crate) fn boot_genesis<P: AsRef<Path>>(
 	Ok(())
 }
 
+fn validate_genesis_output_matches_request(
+	genesis_output: &GenesisOutput,
+	requested_set: &GenesisSet,
+	requested_dr_key: Option<&[u8]>,
+) -> Result<(), Error> {
+	if genesis_output.set != *requested_set
+		|| genesis_output.dr_key.as_deref() != requested_dr_key
+	{
+		return Err(Error::GenesisOutputDoesNotMatchRequest);
+	}
+	Ok(())
+}
+
 pub(crate) fn verify_genesis<P: AsRef<Path>>(
 	namespace_dir: P,
 	master_seed_path: P,
@@ -588,8 +656,8 @@ pub(crate) fn verify_genesis<P: AsRef<Path>>(
 	);
 
 	let master_seed_path = master_seed_path.as_ref();
-	let master_seed_hex =
-		fs::read_to_string(master_seed_path).unwrap_or_else(|e| {
+	let master_seed_hex = read_master_seed_hex(master_seed_path)
+		.unwrap_or_else(|e| {
 			panic!(
 				"verify_genesis: Could not read master seed from {}: {e}",
 				master_seed_path.display()
@@ -603,7 +671,7 @@ pub(crate) fn verify_genesis<P: AsRef<Path>>(
 	});
 
 	// sanity check our logic to read in master seed
-	if pair.to_master_seed_hex() != master_seed_hex.as_bytes() {
+	if pair.to_master_seed_hex().as_slice() != master_seed_hex.as_bytes() {
 		return Err(Error::ErrorReadingSeed);
 	}
 
@@ -625,11 +693,13 @@ pub(crate) fn verify_genesis<P: AsRef<Path>>(
 	if expected_signature != genesis_output.test_message_signature {
 		return Err(Error::CouldNotReproduceSignature);
 	}
-	println!("Quorum key signature over test message was deterministically reproduced");
+	println!(
+		"Quorum key signature over test message was deterministically reproduced"
+	);
 
 	// check test_message_ciphertext
 	let plaintext = pair.decrypt(&genesis_output.test_message_ciphertext)?;
-	if plaintext != genesis_output.test_message {
+	if plaintext[..] != genesis_output.test_message {
 		return Err(Error::BadDecryption);
 	}
 	println!("Successfully decrypted test message ciphertext");
@@ -637,6 +707,19 @@ pub(crate) fn verify_genesis<P: AsRef<Path>>(
 	println!("verify-genesis successful");
 
 	Ok(())
+}
+
+fn read_master_seed_hex(path: &Path) -> io::Result<Zeroizing<String>> {
+	read_secret_utf8(path)
+}
+
+fn read_secret_utf8(path: &Path) -> io::Result<Zeroizing<String>> {
+	let mut file = File::open(path)?;
+	let mut bytes = Zeroizing::new(Vec::new());
+	file.read_to_end(&mut bytes)?;
+	let value = std::str::from_utf8(&bytes)
+		.map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+	Ok(Zeroizing::new(value.to_owned()))
 }
 
 pub(crate) struct AfterGenesisArgs<P: AsRef<Path>> {
@@ -750,11 +833,12 @@ pub(crate) struct GenerateManifestArgs<P: AsRef<Path>> {
 	pub pcr3_preimage_path: P,
 	pub share_set_dir: P,
 	pub manifest_set_dir: P,
-	pub patch_set_dir: P,
+	pub patch_set_dir: Option<P>,
 	pub quorum_key_path: P,
 	pub manifest_path: P,
 	pub pivot_args: Vec<String>,
 	pub bridge_config: Vec<BridgeConfig>,
+	pub dns_resolvers: Option<Vec<IpAddr>>,
 	pub debug_mode: bool,
 }
 
@@ -775,8 +859,13 @@ pub(crate) fn generate_manifest<P: AsRef<Path>>(
 		manifest_path,
 		pivot_args,
 		bridge_config,
+		dns_resolvers,
 		debug_mode,
 	} = args;
+
+	if dns_resolvers.is_some() {
+		return Err(Error::ManifestV1DoesNotSupportDnsConfig);
+	}
 
 	let nitro_config =
 		extract_nitro_config(qos_release_dir_path, pcr3_preimage_path);
@@ -786,33 +875,97 @@ pub(crate) fn generate_manifest<P: AsRef<Path>>(
 	let manifest_set = get_manifest_set(manifest_set_dir);
 	// Get share set keys & threshold
 	let share_set = get_share_set(share_set_dir);
+	let Some(patch_set_dir) = patch_set_dir else {
+		return Err(Error::ManifestV1RequiresPatchSet);
+	};
 	let patch_set = get_patch_set(patch_set_dir);
 	// Get quorum key from namespaces dir
 	let quorum_key = P256Public::from_hex_file(&quorum_key_path)
 		.map_err(Error::FailedToReadQuorumPublicKey)?;
 
-	let manifest = Manifest {
-		namespace: Namespace {
+	let manifest = ManifestBuilder::new()
+		.with_version(ManifestVersion::V1)
+		.namespace(Namespace {
 			name: namespace,
 			nonce,
 			quorum_key: quorum_key.to_bytes(),
-		},
-		pivot: PivotConfig {
-			hash: pivot_hash.try_into().expect("pivot hash was not 256 bits"),
-			restart: restart_policy,
-			args: pivot_args,
-			bridge_config,
-			debug_mode,
-		},
-		manifest_set,
-		share_set,
-		patch_set,
-		enclave: nitro_config,
-	};
+		})
+		.pivot_hash(pivot_hash.try_into().expect("pivot hash was not 256 bits"))
+		.restart_policy(restart_policy)
+		.pivot_args(pivot_args)
+		.bridge_config(bridge_config)
+		.debug_mode(debug_mode)
+		.manifest_set(manifest_set)
+		.share_set(share_set)
+		.patch_set(patch_set)
+		.enclave(nitro_config)
+		.build()?;
+	write_with_msg(
+		manifest_path.as_ref(),
+		&manifest.to_storage_vec().expect("failed to serialize manifest"),
+		"Manifest",
+	);
+
+	Ok(())
+}
+
+pub(crate) fn generate_manifest_v2<P: AsRef<Path>>(
+	args: GenerateManifestArgs<P>,
+) -> Result<(), Error> {
+	let GenerateManifestArgs {
+		nonce,
+		namespace,
+		pivot_hash_path,
+		restart_policy,
+		qos_release_dir_path,
+		pcr3_preimage_path,
+		manifest_set_dir,
+		share_set_dir,
+		patch_set_dir,
+		quorum_key_path,
+		manifest_path,
+		pivot_args,
+		bridge_config,
+		dns_resolvers,
+		debug_mode,
+	} = args;
+
+	if patch_set_dir.is_some() {
+		return Err(Error::ManifestV2DoesNotSupportPatchSet);
+	}
+
+	let nitro_config =
+		extract_nitro_config(qos_release_dir_path, pcr3_preimage_path);
+	let pivot_hash = extract_pivot_hash(pivot_hash_path);
+	let manifest_set = get_manifest_set(manifest_set_dir);
+	let share_set = get_share_set(share_set_dir);
+	let quorum_key = P256Public::from_hex_file(&quorum_key_path)
+		.map_err(Error::FailedToReadQuorumPublicKey)?;
+
+	let manifest = ManifestBuilder::new()
+		.with_version(ManifestVersion::V2)
+		.namespace(Namespace {
+			name: namespace,
+			nonce,
+			quorum_key: quorum_key.to_bytes(),
+		})
+		.pivot_hash(pivot_hash.try_into().expect("pivot hash was not 256 bits"))
+		.restart_policy(restart_policy)
+		.pivot_args(pivot_args)
+		.bridge_config(bridge_config)
+		.debug_mode(debug_mode)
+		.manifest_set(manifest_set)
+		.share_set(share_set)
+		.enclave(nitro_config);
+	let manifest = match dns_resolvers {
+		Some(resolvers) => manifest.dns(DnsConfig { resolvers }),
+		None => manifest,
+	}
+	.build()?;
 
 	write_with_msg(
 		manifest_path.as_ref(),
-		&serde_json::to_vec(&manifest).expect("failed to serialize manifest"),
+		&qos_json::to_vec(&manifest).expect("failed to serialize manifest"),
 		"Manifest",
 	);
 
@@ -846,7 +999,7 @@ pub(crate) struct ApproveManifestArgs<P: AsRef<Path>> {
 	pub quorum_key_path: P,
 	pub manifest_set_dir: P,
 	pub share_set_dir: P,
-	pub patch_set_dir: P,
+	pub patch_set_dir: Option<P>,
 	pub alias: String,
 	pub unsafe_auto_confirm: bool,
 }
@@ -869,15 +1022,23 @@ pub(crate) fn approve_manifest<P: AsRef<Path>>(
 		unsafe_auto_confirm,
 	} = args;
 
-	let manifest = read_manifest(&manifest_path)?;
+	let manifest = read_manifest_compat(&manifest_path)?;
 	let quorum_key = P256Public::from_hex_file(&quorum_key_path)
 		.map_err(Error::FailedToReadQuorumPublicKey)?;
+	let patch_set = match (&manifest, patch_set_dir) {
+		(VersionedManifest::V2(_), Some(_)) => {
+			return Err(Error::ManifestV2DoesNotSupportPatchSet);
+		}
+		(VersionedManifest::V2(_), None) => None,
+		(_, Some(patch_set_dir)) => Some(get_patch_set(patch_set_dir)),
+		(_, None) => return Err(Error::ManifestV1RequiresPatchSet),
+	};
 
 	if !approve_manifest_programmatic_verifications(
 		&manifest,
 		&get_manifest_set(manifest_set_dir),
 		&get_share_set(share_set_dir),
-		&get_patch_set(patch_set_dir),
+		patch_set.as_ref(),
 		&extract_nitro_config(qos_release_dir_path, pcr3_preimage_path),
 		&extract_pivot_hash(pivot_hash_path),
 		&quorum_key,
@@ -899,7 +1060,7 @@ pub(crate) fn approve_manifest<P: AsRef<Path>>(
 	}
 
 	let approval = Approval {
-		signature: pair.sign(&manifest.qos_hash())?,
+		signature: pair.sign(&manifest.manifest_hash())?,
 		member: QuorumMember {
 			pub_key: pair.public_key_bytes()?,
 			alias: alias.clone(),
@@ -909,8 +1070,8 @@ pub(crate) fn approve_manifest<P: AsRef<Path>>(
 	let approval_path = manifest_approvals_dir.as_ref().join(format!(
 		"{}-{}-{}.{}",
 		alias,
-		manifest.namespace.name.replace('/', "-"),
-		manifest.namespace.nonce,
+		manifest.namespace().name.replace('/', "-"),
+		manifest.namespace().nonce,
 		APPROVAL_EXT
 	));
 	write_with_msg(
@@ -925,46 +1086,61 @@ pub(crate) fn approve_manifest<P: AsRef<Path>>(
 }
 
 fn approve_manifest_programmatic_verifications(
-	manifest: &Manifest,
+	manifest: &VersionedManifest,
 	manifest_set: &ManifestSet,
 	share_set: &ShareSet,
-	patch_set: &PatchSet,
+	patch_set: Option<&PatchSet>,
 	nitro_config: &NitroConfig,
 	pivot_hash: &[u8],
 	quorum_key: &P256Public,
 ) -> bool {
 	// Verify manifest set composition
-	if manifest.manifest_set != *manifest_set {
+	if manifest.manifest_set() != manifest_set {
 		eprintln!("Manifest Set composition does not match");
 		return false;
 	}
 
 	// Verify share set composition
-	if manifest.share_set != *share_set {
+	if manifest.share_set() != share_set {
 		eprintln!("Share Set composition does not match");
 		return false;
 	}
 
 	// Verify share set composition
-	if manifest.patch_set != *patch_set {
-		eprintln!("Share Set composition does not match");
-		return false;
+	match manifest {
+		VersionedManifest::V2(_) => {}
+		VersionedManifest::V1(manifest) => {
+			if Some(&manifest.patch_set) != patch_set {
+				eprintln!("Patch Set composition does not match");
+				return false;
+			}
+		}
+		VersionedManifest::V0(manifest) => {
+			if Some(&manifest.patch_set) != patch_set {
+				eprintln!("Patch Set composition does not match");
+				return false;
+			}
+		}
+		_ => {
+			eprintln!("Manifest version is not supported");
+			return false;
+		}
 	}
 
 	// Verify pcrs 0, 1, 2, 3.
-	if manifest.enclave != *nitro_config {
+	if manifest.enclave() != nitro_config {
 		eprintln!("Nitro configuration does not match");
 		return false;
 	}
 
 	// Verify the pivot could be built deterministically
-	if manifest.pivot.hash != pivot_hash {
+	if manifest.pivot_hash().as_slice() != pivot_hash {
 		eprintln!("Pivot hash does not match");
 		return false;
 	}
 
 	// Verify the intended Quorum Key is being used
-	if manifest.namespace.quorum_key != quorum_key.to_bytes() {
+	if manifest.namespace().quorum_key != quorum_key.to_bytes() {
 		eprintln!("Quorum public key does not match");
 		return false;
 	}
@@ -973,18 +1149,29 @@ fn approve_manifest_programmatic_verifications(
 }
 
 fn approve_manifest_human_verifications<R, W>(
-	manifest: &Manifest,
+	manifest: &VersionedManifest,
 	prompter: &mut Prompter<R, W>,
 ) -> bool
 where
 	R: BufRead,
 	W: Write,
 {
+	// Check the manifest schema version
+	{
+		let prompt = format!(
+			"Is this the correct manifest schema version: {}? (y/n)",
+			manifest.version_label()
+		);
+		if !prompter.prompt_is_yes(&prompt) {
+			return false;
+		}
+	}
+
 	// Check the namespace name
 	{
 		let prompt = format!(
 			"Is this the correct namespace name: {}? (y/n)",
-			manifest.namespace.name
+			manifest.namespace().name
 		);
 		if !prompter.prompt_is_yes(&prompt) {
 			return false;
@@ -995,7 +1182,7 @@ where
 	{
 		let prompt = format!(
 			"Is this the correct namespace nonce: {}? (y/n)",
-			manifest.namespace.nonce
+			manifest.namespace().nonce
 		);
 		if !prompter.prompt_is_yes(&prompt) {
 			return false;
@@ -1006,7 +1193,7 @@ where
 	{
 		let prompt = format!(
 			"Is this the correct pivot restart policy: {:?}? (y/n)",
-			manifest.pivot.restart
+			manifest.restart()
 		);
 		if !prompter.prompt_is_yes(&prompt) {
 			return false;
@@ -1017,8 +1204,48 @@ where
 	{
 		let prompt = format!(
 			"Are these the correct pivot args:\n{:?}?\n(y/n)",
-			manifest.pivot.args
+			manifest.args()
 		);
+		if !prompter.prompt_is_yes(&prompt) {
+			return false;
+		}
+	}
+
+	// Check pivot debug mode
+	{
+		let prompt = format!(
+			"Is this the correct pivot debug mode: {}? (y/n)",
+			manifest.debug_mode()
+		);
+		if !prompter.prompt_is_yes(&prompt) {
+			return false;
+		}
+	}
+
+	// Check pivot bridge configuration
+	{
+		let prompt = format!(
+			"Is this the correct pivot bridge configuration:\n{:?}?\n(y/n)",
+			manifest.bridge_config()
+		);
+		if !prompter.prompt_is_yes(&prompt) {
+			return false;
+		}
+	}
+
+	// Check DNS resolvers for manifests that support DNS configuration
+	if let VersionedManifest::V2(v2_manifest) = manifest {
+		let prompt = match &v2_manifest.dns {
+			None =>
+				"Is this the correct DNS configuration: absent? (y/n)".to_string(),
+			Some(dns) if dns.resolvers.is_empty() =>
+				"Is this the correct DNS configuration: configured with no resolvers? (y/n)"
+					.to_string(),
+			Some(dns) => format!(
+				"Are these the correct DNS resolvers:\n{:?}?\n(y/n)",
+				dns.resolvers
+			),
+		};
 		if !prompter.prompt_is_yes(&prompt) {
 			return false;
 		}
@@ -1032,14 +1259,33 @@ pub(crate) fn generate_manifest_envelope<P: AsRef<Path>>(
 	manifest_path: P,
 	maybe_manifest_envelope_path: Option<String>,
 ) -> Result<(), Error> {
-	let manifest = read_manifest(&manifest_path)?;
+	let manifest = read_manifest_compat(&manifest_path)?;
 	let approvals = find_approvals(&manifest_approvals_dir, &manifest);
 
 	// Create manifest envelope
-	let manifest_envelope = ManifestEnvelope {
-		manifest,
-		manifest_set_approvals: approvals,
-		share_set_approvals: vec![],
+	let manifest_envelope = match manifest {
+		VersionedManifest::V2(manifest) => {
+			VersionedManifestEnvelope::V2(ManifestEnvelopeV2 {
+				manifest,
+				manifest_set_approvals: approvals,
+				share_set_approvals: vec![],
+			})
+		}
+		VersionedManifest::V1(manifest) => {
+			VersionedManifestEnvelope::V1(ManifestEnvelopeV1 {
+				manifest,
+				manifest_set_approvals: approvals,
+				share_set_approvals: vec![],
+			})
+		}
+		VersionedManifest::V0(manifest) => {
+			VersionedManifestEnvelope::V0(ManifestEnvelopeV0 {
+				manifest,
+				manifest_set_approvals: approvals,
+				share_set_approvals: vec![],
+			})
+		}
+		_ => return Err(Error::UnsupportedManifestVersion),
 	};
 
 	if let Err(e) = manifest_envelope.check_approvals() {
@@ -1053,7 +1299,8 @@ pub(crate) fn generate_manifest_envelope<P: AsRef<Path>>(
 	);
 	write_with_msg(
 		&path,
-		&serde_json::to_vec(&manifest_envelope)
+		&manifest_envelope
+			.to_storage_vec()
 			.expect("Failed to serialize manifest envelope"),
 		"Manifest Envelope",
 	);
@@ -1069,20 +1316,24 @@ pub(crate) fn boot_key_fwd<P: AsRef<Path>>(
 ) -> Result<(), Error> {
 	let pivot =
 		fs::read(pivot_path.as_ref()).map_err(Error::FailedToReadPivot)?;
-	let manifest_envelope = read_manifest_envelope(manifest_envelope_path)?;
+	let manifest_envelope =
+		read_manifest_envelope_compat(manifest_envelope_path)?;
+	let encodings = manifest_envelope_protocol_encodings(&manifest_envelope);
 
 	let req = ProtocolMsg::BootKeyForwardRequest {
 		manifest_envelope: Box::new(manifest_envelope),
 		pivot,
 	};
-	let cose_sign1 = match request::post(uri, &req).unwrap() {
-		ProtocolMsg::BootKeyForwardResponse {
-			nsm_response: NsmResponse::Attestation { document },
-		} => document,
-		r => {
-			return Err(Error::UnexpectedProtocolMsgResponse(format!("{r:?}")))
-		}
-	};
+	let cose_sign1 =
+		post_request_with_encoding_fallback(uri, &req, encodings, |resp| {
+			match resp {
+				ProtocolMsg::BootKeyForwardResponse {
+					nsm_response: NsmResponse::Attestation { document },
+				} => Ok(document),
+				r => Err(format!("{r:?}")),
+			}
+		})
+		.map_err(Error::UnexpectedProtocolMsgResponse)?;
 
 	write_with_msg(
 		attestation_doc_path.as_ref(),
@@ -1099,7 +1350,9 @@ pub(crate) fn export_key<P: AsRef<Path>>(
 	attestation_doc_path: P,
 	encrypted_quorum_key_path: P,
 ) -> Result<(), Error> {
-	let manifest_envelope = read_manifest_envelope(manifest_envelope_path)?;
+	let manifest_envelope =
+		read_manifest_envelope_compat(manifest_envelope_path)?;
+	let encodings = manifest_envelope_protocol_encodings(&manifest_envelope);
 	let cose_sign1_attestation_doc = fs::read(attestation_doc_path.as_ref())
 		.map_err(Error::FailedToReadAttestationDoc)?;
 
@@ -1108,14 +1361,17 @@ pub(crate) fn export_key<P: AsRef<Path>>(
 		cose_sign1_attestation_doc,
 	};
 
-	let encrypted_quorum_key = match request::post(uri, &req).unwrap() {
-		ProtocolMsg::ExportKeyResponse { encrypted_quorum_key, signature } => {
-			EncryptedQuorumKey { encrypted_quorum_key, signature }
-		}
-		r => {
-			return Err(Error::UnexpectedProtocolMsgResponse(format!("{r:?}")))
-		}
-	};
+	let encrypted_quorum_key =
+		post_request_with_encoding_fallback(uri, &req, encodings, |resp| {
+			match resp {
+				ProtocolMsg::ExportKeyResponse {
+					encrypted_quorum_key,
+					signature,
+				} => Ok(EncryptedQuorumKey { encrypted_quorum_key, signature }),
+				r => Err(format!("{r:?}")),
+			}
+		})
+		.map_err(Error::UnexpectedProtocolMsgResponse)?;
 
 	write_with_msg(
 		encrypted_quorum_key_path.as_ref(),
@@ -1124,6 +1380,53 @@ pub(crate) fn export_key<P: AsRef<Path>>(
 	);
 
 	Ok(())
+}
+
+fn post_request_with_encoding_fallback<T, F>(
+	uri: &str,
+	req: &ProtocolMsg,
+	encodings: &[ProtocolMsgEncoding],
+	parse: F,
+) -> Result<T, String>
+where
+	F: Fn(ProtocolMsg) -> Result<T, String>,
+{
+	let mut errors = vec![];
+
+	for &encoding in encodings {
+		match post_request_with_encoding(uri, req, encoding) {
+			Ok(resp) => match parse(resp) {
+				Ok(value) => return Ok(value),
+				Err(err) => errors
+					.push(format!("{encoding:?}: unexpected response {err}")),
+			},
+			Err(err) => errors.push(format!("{encoding:?}: {err}")),
+		}
+	}
+
+	Err(errors.join("; "))
+}
+
+fn post_request_with_encoding(
+	uri: &str,
+	req: &ProtocolMsg,
+	encoding: ProtocolMsgEncoding,
+) -> Result<ProtocolMsg, String> {
+	match encoding {
+		ProtocolMsgEncoding::Borsh => request::post_borsh(uri, req),
+		ProtocolMsgEncoding::Json => request::post_json(uri, req),
+	}
+}
+
+fn manifest_envelope_protocol_encodings(
+	manifest_envelope: &VersionedManifestEnvelope,
+) -> &'static [ProtocolMsgEncoding] {
+	match manifest_envelope {
+		VersionedManifestEnvelope::V2(_) => &[ProtocolMsgEncoding::Json],
+		VersionedManifestEnvelope::V1(_) | VersionedManifestEnvelope::V0(_) => {
+			&[ProtocolMsgEncoding::Borsh, ProtocolMsgEncoding::Json]
+		}
+	}
 }
 
 pub(crate) fn inject_key<P: AsRef<Path>>(
@@ -1145,7 +1448,7 @@ pub(crate) fn inject_key<P: AsRef<Path>>(
 	match request::post(uri, &req).unwrap() {
 		ProtocolMsg::InjectKeyResponse => println!("Successful key injection!"),
 		r => {
-			return Err(Error::UnexpectedProtocolMsgResponse(format!("{r:?}")))
+			return Err(Error::UnexpectedProtocolMsgResponse(format!("{r:?}")));
 		}
 	}
 
@@ -1158,6 +1461,44 @@ pub(crate) struct BootStandardArgs<P: AsRef<Path>> {
 	pub manifest_envelope_path: P,
 	pub pcr3_preimage_path: P,
 	pub unsafe_skip_attestation: bool,
+}
+
+fn boot_standard_attestation_doc_with_fallback(
+	uri: &str,
+	manifest_envelope: VersionedManifestEnvelope,
+	pivot: Vec<u8>,
+) -> Result<Vec<u8>, Error> {
+	let req = ProtocolMsg::BootStandardJsonEnvelopeRequest {
+		manifest_envelope: Box::new(JsonBytes::new(manifest_envelope)),
+		pivot,
+	};
+	if let Ok(ProtocolMsg::BootStandardResponse {
+		nsm_response: NsmResponse::Attestation { document },
+	}) = request::post_borsh(uri, &req)
+	{
+		return Ok(document);
+	}
+
+	let ProtocolMsg::BootStandardJsonEnvelopeRequest {
+		manifest_envelope,
+		pivot,
+	} = req
+	else {
+		unreachable!(
+			"request was constructed as BootStandardJsonEnvelopeRequest"
+		)
+	};
+	let req = ProtocolMsg::BootStandardRequest {
+		manifest_envelope: Box::new(manifest_envelope.into_inner()),
+		pivot,
+	};
+	match request::post_borsh(uri, &req) {
+		Ok(ProtocolMsg::BootStandardResponse {
+			nsm_response: NsmResponse::Attestation { document },
+		}) => Ok(document),
+		Ok(r) => Err(Error::UnexpectedProtocolMsgResponse(format!("{r:?}"))),
+		Err(err) => Err(Error::UnexpectedProtocolMsgResponse(err)),
+	}
 }
 
 pub(crate) fn boot_standard<P: AsRef<Path>>(
@@ -1174,21 +1515,17 @@ pub(crate) fn boot_standard<P: AsRef<Path>>(
 		fs::read(pivot_path.as_ref()).map_err(Error::FailedToReadPivot)?;
 
 	// Create manifest envelope
-	let manifest_envelope = read_manifest_envelope(manifest_envelope_path)?;
-	let manifest = manifest_envelope.manifest.clone();
+	let manifest_envelope =
+		read_manifest_envelope_compat(manifest_envelope_path)?;
+	let manifest = manifest_envelope.clone().manifest();
 
-	let req = ProtocolMsg::BootStandardRequest {
-		manifest_envelope: Box::new(manifest_envelope),
-		pivot,
-	};
 	// Broadcast boot standard instruction and extract the attestation doc from
 	// the response.
-	let cose_sign1 = match request::post(&uri, &req).unwrap() {
-		ProtocolMsg::BootStandardResponse {
-			nsm_response: NsmResponse::Attestation { document },
-		} => document,
-		r => panic!("Unexpected response: {r:?}"),
-	};
+	let cose_sign1 = boot_standard_attestation_doc_with_fallback(
+		&uri,
+		manifest_envelope,
+		pivot,
+	)?;
 
 	let attestation_doc =
 		extract_attestation_doc(&cose_sign1, unsafe_skip_attestation, None);
@@ -1197,13 +1534,20 @@ pub(crate) fn boot_standard<P: AsRef<Path>>(
 	if unsafe_skip_attestation {
 		println!("**WARNING:** Skipping attestation document verification.");
 	} else {
-		verify_attestation_doc_against_user_input(
+		check_pcr3_preimage_against_manifest(
+			&find_pcr3(&pcr3_preimage_path),
+			&manifest.enclave().pcr3,
+		)?;
+
+		verify_attestation_doc_against_manifest_setup(
 			&attestation_doc,
-			&manifest.qos_hash(),
-			&manifest.enclave.pcr0,
-			&manifest.enclave.pcr1,
-			&manifest.enclave.pcr2,
-			&extract_pcr3(pcr3_preimage_path),
+			ManifestAttestationInput {
+				manifest_hash: &manifest.manifest_hash(),
+				pcr0: &manifest.enclave().pcr0,
+				pcr1: &manifest.enclave().pcr1,
+				pcr2: &manifest.enclave().pcr2,
+				pcr3: &manifest.enclave().pcr3,
+			},
 		)?;
 
 		// Sanity check the ephemeral key is valid
@@ -1222,20 +1566,22 @@ pub(crate) fn get_attestation_doc<P: AsRef<Path>>(
 	attestation_doc_path: P,
 	manifest_envelope_path: P,
 ) {
-	let (cose_sign1, manifest_envelope) =
-		match request::post(uri, &ProtocolMsg::LiveAttestationDocRequest) {
-			Ok(ProtocolMsg::LiveAttestationDocResponse {
-				nsm_response: NsmResponse::Attestation { document },
-				manifest_envelope: Some(manifest_envelope),
-			}) => (document, manifest_envelope),
-			Ok(ProtocolMsg::LiveAttestationDocResponse {
-				nsm_response: _,
-				manifest_envelope: None,
-			}) => panic!(
-				"ManifestEnvelope does not exist in enclave - likely waiting for boot instruction"
-			),
-			r => panic!("Unexpected response: {r:?}"),
-		};
+	let (cose_sign1, manifest_envelope) = match request::post(
+		uri,
+		&ProtocolMsg::LiveAttestationDocRequest,
+	) {
+		Ok(ProtocolMsg::LiveAttestationDocResponse {
+			nsm_response: NsmResponse::Attestation { document },
+			manifest_envelope: Some(manifest_envelope),
+		}) => (document, manifest_envelope),
+		Ok(ProtocolMsg::LiveAttestationDocResponse {
+			nsm_response: _,
+			manifest_envelope: None,
+		}) => panic!(
+			"ManifestEnvelope does not exist in enclave - likely waiting for boot instruction"
+		),
+		r => panic!("Unexpected response: {r:?}"),
+	};
 
 	write_with_msg(
 		attestation_doc_path.as_ref(),
@@ -1286,25 +1632,34 @@ pub(crate) fn proxy_re_encrypt_share<P: AsRef<Path>>(
 		unsafe_auto_confirm,
 	}: ProxyReEncryptShareArgs<P>,
 ) -> Result<(), Error> {
-	let manifest_envelope = read_manifest_envelope(&manifest_envelope_path)?;
+	let manifest_envelope =
+		read_manifest_envelope_compat(&manifest_envelope_path)?;
 	let attestation_doc =
 		read_attestation_doc(&attestation_doc_path, unsafe_skip_attestation)?;
 	let encrypted_share = std::fs::read(share_path)
 		.map_err(|e| Error::ReadShare(e.to_string()))?;
 
 	let pcr3_preimage = find_pcr3(&pcr3_preimage_path);
+	let manifest = manifest_envelope.clone().manifest();
 
 	// Verify the attestation doc matches up with the pcrs in the manifest
 	if unsafe_skip_attestation {
 		println!("**WARNING:** Skipping attestation document verification.");
 	} else {
-		verify_attestation_doc_against_user_input(
+		check_pcr3_preimage_against_manifest(
+			&pcr3_preimage,
+			&manifest.enclave().pcr3,
+		)?;
+
+		verify_attestation_doc_against_manifest_setup(
 			&attestation_doc,
-			&manifest_envelope.manifest.qos_hash(),
-			&manifest_envelope.manifest.enclave.pcr0,
-			&manifest_envelope.manifest.enclave.pcr1,
-			&manifest_envelope.manifest.enclave.pcr2,
-			&extract_pcr3(pcr3_preimage_path),
+			ManifestAttestationInput {
+				manifest_hash: &manifest_envelope.manifest_hash(),
+				pcr0: &manifest.enclave().pcr0,
+				pcr1: &manifest.enclave().pcr1,
+				pcr2: &manifest.enclave().pcr2,
+				pcr3: &manifest.enclave().pcr3,
+			},
 		)?;
 	}
 
@@ -1358,7 +1713,7 @@ pub(crate) fn proxy_re_encrypt_share<P: AsRef<Path>>(
 
 	let approval = serde_json::to_vec(&Approval {
 		signature: pair
-			.sign(&manifest_envelope.manifest.qos_hash())
+			.sign(&manifest_envelope.manifest_hash())
 			.expect("Failed to sign"),
 		member,
 	})
@@ -1378,24 +1733,28 @@ pub(crate) fn proxy_re_encrypt_share<P: AsRef<Path>>(
 }
 
 fn proxy_re_encrypt_share_programmatic_verifications(
-	manifest_envelope: &ManifestEnvelope,
+	manifest_envelope: &VersionedManifestEnvelope,
 	manifest_set: &ManifestSet,
 	member: &QuorumMember,
 ) -> bool {
+	let manifest = manifest_envelope.clone().manifest();
+
 	if let Err(e) = manifest_envelope.check_approvals() {
 		eprintln!("Manifest envelope did not have valid approvals: {e:?}");
 		return false;
 	}
 
-	if manifest_envelope.manifest.manifest_set != *manifest_set {
+	if *manifest.manifest_set() != *manifest_set {
 		eprintln!(
 			"Manifest's manifest set does not match locally found Manifest Set"
 		);
 		return false;
 	}
 
-	if !manifest_envelope.manifest.share_set.members.contains(member) {
-		eprintln!("The provided share set key and alias are not part of the Share Set");
+	if !manifest.share_set().members.contains(member) {
+		eprintln!(
+			"The provided share set key and alias are not part of the Share Set"
+		);
 		return false;
 	}
 
@@ -1403,7 +1762,7 @@ fn proxy_re_encrypt_share_programmatic_verifications(
 }
 
 fn proxy_re_encrypt_share_human_verifications<R, W>(
-	manifest_envelope: &ManifestEnvelope,
+	manifest_envelope: &VersionedManifestEnvelope,
 	pcr3_preimage: &str,
 	prompter: &mut Prompter<R, W>,
 ) -> bool
@@ -1411,11 +1770,13 @@ where
 	R: BufRead,
 	W: Write,
 {
+	let manifest = manifest_envelope.clone().manifest();
+
 	// Check the namespace name
 	{
 		let prompt = format!(
 			"Is this the correct namespace name: {}? (y/n)",
-			manifest_envelope.manifest.namespace.name
+			manifest.namespace().name
 		);
 		if !prompter.prompt_is_yes(&prompt) {
 			return false;
@@ -1426,7 +1787,7 @@ where
 	{
 		let prompt = format!(
 			"Is this the correct namespace nonce: {}? (y/n)",
-			manifest_envelope.manifest.namespace.nonce
+			manifest.namespace().nonce
 		);
 		if !prompter.prompt_is_yes(&prompt) {
 			return false;
@@ -1445,7 +1806,7 @@ where
 
 	{
 		let mut approvers = manifest_envelope
-			.manifest_set_approvals
+			.manifest_set_approvals()
 			.iter()
 			.cloned()
 			.map(|m| m.member.alias)
@@ -1584,10 +1945,13 @@ pub(crate) fn p256_asymmetric_decrypt<P: AsRef<Path>>(
 	let ciphertext = std::fs::read(ciphertext_path.as_ref())?;
 
 	let plaintext = pair.decrypt(&ciphertext)?;
-	let file_contents =
-		if output_hex { qos_hex::encode_to_vec(&plaintext) } else { plaintext };
+	let file_contents: Zeroizing<Vec<u8>> = if output_hex {
+		Zeroizing::new(qos_hex::encode_to_vec(&plaintext))
+	} else {
+		plaintext
+	};
 
-	write_with_msg(plaintext_path.as_ref(), &file_contents, "Plaintext");
+	write_secret_with_msg(plaintext_path.as_ref(), &file_contents, "Plaintext");
 
 	Ok(())
 }
@@ -1618,7 +1982,7 @@ pub(crate) fn display<P: AsRef<Path>>(
 ) -> Result<(), Error> {
 	match *display_type {
 		DisplayType::Manifest => {
-			let decoded = read_manifest(file_path)?;
+			let decoded = read_manifest_compat(file_path)?;
 
 			if json {
 				println!("{}", serde_json::to_string(&decoded).unwrap());
@@ -1627,7 +1991,7 @@ pub(crate) fn display<P: AsRef<Path>>(
 			}
 		}
 		DisplayType::ManifestEnvelope => {
-			let decoded = read_manifest_envelope(file_path)?;
+			let decoded = read_manifest_envelope_compat(file_path)?;
 
 			if json {
 				println!("{}", serde_json::to_string(&decoded).unwrap());
@@ -1652,7 +2016,7 @@ pub(crate) fn json_to_borsh<P: AsRef<Path>>(
 ) -> Result<(), Error> {
 	match *display_type {
 		DisplayType::Manifest => {
-			let manifest = read_manifest(&file_path)?;
+			let manifest = read_manifest_v1_compat(&file_path)?;
 			let borsh_bytes = borsh::to_vec(&manifest)?;
 			fs::write(&output_path, borsh_bytes).map_err(|e| {
 				Error::FailedToWrite {
@@ -1662,7 +2026,7 @@ pub(crate) fn json_to_borsh<P: AsRef<Path>>(
 			})?;
 		}
 		DisplayType::ManifestEnvelope => {
-			let envelope = read_manifest_envelope(&file_path)?;
+			let envelope = read_manifest_envelope_v1_compat(&file_path)?;
 			let borsh_bytes = borsh::to_vec(&envelope)?;
 			fs::write(&output_path, borsh_bytes).map_err(|e| {
 				Error::FailedToWrite {
@@ -1699,9 +2063,12 @@ pub(crate) fn dangerous_dev_boot<P: AsRef<Path>>(
 	};
 
 	// Shard it with N=2, K=2
-	let shares =
-		qos_crypto::shamir::shares_generate(quorum_pair.to_master_seed(), 2, 2)
-			.unwrap();
+	let shares = qos_crypto::shamir::shares_generate(
+		&quorum_pair.to_master_seed()[..],
+		2,
+		2,
+	)
+	.unwrap();
 	assert_eq!(
 		shares.len(),
 		2,
@@ -1758,28 +2125,29 @@ pub(crate) fn dangerous_dev_boot<P: AsRef<Path>>(
 	let manifest_envelope = {
 		let signature =
 			quorum_pair.sign(&manifest.qos_hash()).expect("Failed to sign");
-		Box::new(ManifestEnvelope {
+		Box::new(VersionedManifestEnvelope::V1(ManifestEnvelope {
 			manifest,
 			manifest_set_approvals: vec![Approval { signature, member }],
 			share_set_approvals: vec![],
-		})
+		}))
 	};
 
-	let req = ProtocolMsg::BootStandardRequest {
-		manifest_envelope: manifest_envelope.clone(),
+	let document = boot_standard_attestation_doc_with_fallback(
+		uri,
+		manifest_envelope.as_ref().clone(),
 		pivot,
-	};
-	let attestation_doc = match request::post(uri, &req).unwrap() {
-		ProtocolMsg::BootStandardResponse {
-			nsm_response: NsmResponse::Attestation { document },
-		} => extract_attestation_doc(&document, true, None),
-		r => panic!("Unexpected response: {r:?}"),
-	};
+	)
+	.unwrap();
+	let attestation_doc = extract_attestation_doc(&document, true, None);
 
 	// Pull out the ephemeral key or use the override
 	let eph_pub: P256Public = if let Some(eph_path) = unsafe_eph_path_override {
 		P256Pair::from_hex_file(eph_path)
-			.unwrap_or_else(|e| panic!("dangerous_dev_boot: Could not read ephemeral key from {eph_path:?}: {e:?}"))
+			.unwrap_or_else(|e| {
+				panic!(
+					"dangerous_dev_boot: Could not read ephemeral key from {eph_path:?}: {e:?}"
+				)
+			})
 			.public_key()
 	} else {
 		P256Public::from_bytes(&attestation_doc.public_key.expect(
@@ -1791,7 +2159,7 @@ pub(crate) fn dangerous_dev_boot<P: AsRef<Path>>(
 	// Create ShareSet approval
 	let approval = Approval {
 		signature: quorum_pair
-			.sign(&manifest_envelope.manifest.qos_hash())
+			.sign(&manifest_envelope.manifest_hash())
 			.expect("Failed to sign"),
 		member: QuorumMember {
 			pub_key: quorum_pair.public_key().to_bytes(),
@@ -1837,10 +2205,9 @@ pub(crate) fn shamir_split(
 	threshold: usize,
 	output_dir: &str,
 ) -> Result<(), Error> {
-	let secret = fs::read(&secret_path).map_err(|e| Error::FailedToRead {
-		path: secret_path,
-		error: e.to_string(),
-	})?;
+	let secret = Zeroizing::new(fs::read(&secret_path).map_err(|e| {
+		Error::FailedToRead { path: secret_path, error: e.to_string() }
+	})?);
 	let shares =
 		qos_crypto::shamir::shares_generate(&secret, total_shares, threshold)
 			.unwrap();
@@ -1848,7 +2215,7 @@ pub(crate) fn shamir_split(
 	for (i, share) in shares.iter().enumerate() {
 		let file_name = format!("{}.share", i + 1);
 		let file_path = PathBuf::from(&output_dir).join(&file_name);
-		write_with_msg(&file_path, share, &file_name);
+		write_secret_with_msg(&file_path, &share[..], &file_name);
 	}
 
 	Ok(())
@@ -1861,17 +2228,20 @@ pub(crate) fn shamir_reconstruct(
 	let shares = shares
 		.into_iter()
 		.map(|p| {
-			fs::read(&p).map_err(|e| Error::FailedToRead {
+			fs::read(&p).map(Zeroizing::new).map_err(|e| Error::FailedToRead {
 				path: p,
 				error: e.to_string(),
 			})
 		})
-		.collect::<Result<Vec<Vec<u8>>, Error>>()?;
+		.collect::<Result<Vec<Zeroizing<Vec<u8>>>, Error>>()?;
 
-	let secret =
-		Zeroizing::new(qos_crypto::shamir::shares_reconstruct(shares).unwrap());
+	let secret = qos_crypto::shamir::shares_reconstruct(shares).unwrap();
 
-	write_with_msg(output_path.as_ref(), &secret, "Reconstructed secret");
+	write_secret_with_msg(
+		output_path.as_ref(),
+		&secret,
+		"Reconstructed secret",
+	);
 
 	Ok(())
 }
@@ -1977,7 +2347,10 @@ fn get_manifest_set<P: AsRef<Path>>(dir: P) -> ManifestSet {
 			}
 
 			let public = P256Public::from_hex_file(path).unwrap_or_else(|e| {
-				panic!("get_manifest_set: Could not read public key from {}: {e:?}", path.display())
+				panic!(
+					"get_manifest_set: Could not read public key from {}: {e:?}",
+					path.display()
+				)
 			});
 			Some(QuorumMember {
 				alias: mem::take(&mut file_name[0]),
@@ -2050,8 +2423,9 @@ fn get_genesis_set<P: AsRef<Path>>(dir: P) -> GenesisSet {
 
 fn find_approvals<P: AsRef<Path>>(
 	boot_dir: P,
-	manifest: &Manifest,
+	manifest: &VersionedManifest,
 ) -> Vec<Approval> {
+	let manifest_hash = manifest.manifest_hash();
 	let approvals: Vec<_> = find_file_paths(&boot_dir)
 		.iter()
 		.filter_map(|path| {
@@ -2063,14 +2437,20 @@ fn find_approvals<P: AsRef<Path>>(
 
 			let approval: Approval =
 				serde_json::from_slice(&fs::read(path).unwrap_or_else(|e| {
-					panic!("find_approvals: Could not read approval from {}: {e}", path.display())
+					panic!(
+						"find_approvals: Could not read approval from {}: {e}",
+						path.display()
+					)
 				}))
 				.unwrap_or_else(|e| {
-					panic!("find_approvals: Could not deserialize approval from {}: {e}", path.display())
+					panic!(
+						"find_approvals: Could not deserialize approval from {}: {e}",
+						path.display()
+					)
 				});
 
 			assert!(
-				manifest.manifest_set.members.contains(&approval.member),
+				manifest.manifest_set().members.contains(&approval.member),
 				"Found approval from member ({:?}) not included in the Manifest Set",
 				approval.member.alias
 			);
@@ -2078,30 +2458,33 @@ fn find_approvals<P: AsRef<Path>>(
 			let pub_key = P256Public::from_bytes(&approval.member.pub_key)
 				.expect("Failed to interpret pub key");
 			assert!(
-				pub_key
-					.verify(&manifest.qos_hash(), &approval.signature)
-					.is_ok(),
+				pub_key.verify(&manifest_hash, &approval.signature).is_ok(),
 				"Approval signature could not be verified against manifest"
 			);
 
 			Some(approval)
 		})
 		.collect();
-	assert!(approvals.len() >= manifest.manifest_set.threshold as usize);
+	assert!(approvals.len() >= manifest.manifest_set().threshold as usize);
 
 	approvals
 }
 
-fn read_manifest<P: AsRef<Path>>(file: P) -> Result<Manifest, Error> {
+fn read_manifest_compat<P: AsRef<Path>>(
+	file: P,
+) -> Result<VersionedManifest, Error> {
 	let bytes = fs::read(file).map_err(Error::FailedToReadManifestFile)?;
+	VersionedManifest::try_from_slice_compat(&bytes).map_err(Error::from)
+}
 
-	// try getting Manifest from json
-	let result = serde_json::from_slice::<Manifest>(&bytes);
-	if result.is_err() {
-		// if not try the old formats
-		Manifest::try_from_slice_compat(&bytes).map_err(Error::from)
-	} else {
-		result.map_err(Error::from)
+fn read_manifest_v1_compat<P: AsRef<Path>>(
+	file: P,
+) -> Result<ManifestV1, Error> {
+	match read_manifest_compat(file)? {
+		VersionedManifest::V2(_) => Err(Error::ManifestV2NotConvertibleToBorsh),
+		VersionedManifest::V1(manifest) => Ok(manifest),
+		VersionedManifest::V0(manifest) => Ok(manifest.into()),
+		_ => Err(Error::UnsupportedManifestVersion),
 	}
 }
 
@@ -2119,18 +2502,28 @@ fn read_attestation_doc<P: AsRef<Path>>(
 	))
 }
 
-fn read_manifest_envelope<P: AsRef<Path>>(
+fn read_manifest_envelope_compat<P: AsRef<Path>>(
 	file: P,
-) -> Result<ManifestEnvelope, Error> {
+) -> Result<VersionedManifestEnvelope, Error> {
 	let bytes = fs::read(file).map_err(Error::FailedToReadManifestFile)?;
 
-	// try getting Manifest from json
-	let result = serde_json::from_slice::<ManifestEnvelope>(&bytes);
-	if result.is_err() {
-		// if not try the old borsh format
-		ManifestEnvelope::try_from_slice_compat(&bytes).map_err(Error::from)
-	} else {
-		result.map_err(Error::from)
+	VersionedManifestEnvelope::try_from_slice_compat(&bytes)
+		.map_err(Error::from)
+}
+
+fn read_manifest_envelope_v1_compat<P: AsRef<Path>>(
+	file: P,
+) -> Result<ManifestEnvelopeV1, Error> {
+	match read_manifest_envelope_compat(file)? {
+		VersionedManifestEnvelope::V2(_) => {
+			Err(Error::ManifestV2NotConvertibleToBorsh)
+		}
+		VersionedManifestEnvelope::V1(envelope) => Ok(envelope),
+		VersionedManifestEnvelope::V0(envelope) => Ok(ManifestEnvelopeV1 {
+			manifest: envelope.manifest.into(),
+			manifest_set_approvals: envelope.manifest_set_approvals,
+			share_set_approvals: envelope.share_set_approvals,
+		}),
 	}
 }
 
@@ -2199,9 +2592,7 @@ fn find_pcr3<P: AsRef<Path>>(file_path: P) -> String {
 	lines.remove(0)
 }
 
-fn extract_pcr3<P: AsRef<Path>>(file_path: P) -> Vec<u8> {
-	let role_arn = find_pcr3(file_path);
-
+fn pcr3_from_preimage(role_arn: &str) -> Vec<u8> {
 	let preimage = {
 		// Pad preimage with 48 bytes
 		let mut preimage = [0u8; 48].to_vec();
@@ -2210,6 +2601,25 @@ fn extract_pcr3<P: AsRef<Path>>(file_path: P) -> Vec<u8> {
 	};
 
 	sha_384(&preimage).to_vec()
+}
+
+fn extract_pcr3<P: AsRef<Path>>(file_path: P) -> Vec<u8> {
+	pcr3_from_preimage(&find_pcr3(file_path))
+}
+
+fn check_pcr3_preimage_against_manifest(
+	pcr3_preimage: &str,
+	manifest_pcr3: &[u8],
+) -> Result<(), Error> {
+	let file_pcr3 = pcr3_from_preimage(pcr3_preimage);
+	if file_pcr3 == manifest_pcr3 {
+		Ok(())
+	} else {
+		Err(Error::Pcr3PreimageDoesNotMatchManifest {
+			manifest_pcr3: qos_hex::encode(manifest_pcr3),
+			file_pcr3: qos_hex::encode(&file_pcr3),
+		})
+	}
 }
 
 fn extract_pivot_hash<P: AsRef<Path>>(file_path: P) -> Vec<u8> {
@@ -2275,6 +2685,26 @@ fn write_with_msg(path: &Path, buf: &[u8], item_name: &str) {
 	println!("{item_name} written to: {path_str}");
 }
 
+fn write_secret_with_msg(path: &Path, buf: &[u8], item_name: &str) {
+	use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+	let path_str = path.as_os_str().to_string_lossy();
+	fs::OpenOptions::new()
+		.write(true)
+		.create(true)
+		.truncate(true)
+		.mode(0o600)
+		.open(path)
+		.and_then(|mut file| {
+			file.set_permissions(fs::Permissions::from_mode(0o600))?;
+			file.write_all(buf)
+		})
+		.unwrap_or_else(|e| {
+			panic!("Failed writing {} to file: {:?}", path_str.clone(), e)
+		});
+	println!("{item_name} written to: {path_str}");
+}
+
 struct Prompter<R, W> {
 	reader: R,
 	writer: W,
@@ -2318,34 +2748,137 @@ where
 
 #[cfg(test)]
 mod tests {
-	use std::vec;
+	use std::{fs, vec};
+	use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 	use qos_core::protocol::{
-		services::boot::{
-			Approval, Manifest, ManifestEnvelope, ManifestSet, MemberPubKey,
-			Namespace, NitroConfig, PatchSet, PivotConfig, QuorumMember,
-			RestartPolicy, ShareSet,
-		},
 		QosHash,
+		msg::ProtocolMsgEncoding,
+		services::boot::{
+			Approval, DnsConfig, Manifest, ManifestEnvelope,
+			ManifestEnvelopeV2, ManifestSet, ManifestV2, ManifestVersion,
+			MemberPubKey, Namespace, NitroConfig, PatchSet, PivotConfig,
+			PivotConfigV2, PivotEnv, QuorumMember, RestartPolicy, ShareSet,
+			VersionedManifest, VersionedManifestEnvelope,
+		},
+		services::genesis::{GenesisOutput, GenesisSet},
 	};
-	use qos_nsm::nitro::{cert_from_pem, AWS_ROOT_CERT_PEM};
+	use qos_nsm::nitro::{AWS_ROOT_CERT_PEM, cert_from_pem};
 	use qos_p256::{P256Pair, P256Public};
+	use qos_test_primitives::PathWrapper;
 
 	use super::{
-		approve_manifest_human_verifications,
+		Prompter, approve_manifest_human_verifications,
 		approve_manifest_programmatic_verifications,
 		proxy_re_encrypt_share_human_verifications,
-		proxy_re_encrypt_share_programmatic_verifications, Prompter,
+		proxy_re_encrypt_share_programmatic_verifications,
 	};
 
+	#[test]
+	fn zeroizes_yubikey_pin_on_success_and_error() {
+		fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+		assert_zeroize_on_drop::<Zeroizing<Vec<u8>>>();
+		assert_zeroize_on_drop::<Zeroizing<String>>();
+
+		let path = std::env::temp_dir()
+			.join(format!("qos-zeroizing-pin-{}", std::process::id()));
+		fs::write(&path, "123456\nignored").unwrap();
+		{
+			let pin = super::pin_from_path(&path);
+			assert_eq!(&*pin, b"123456");
+		} // Zeroizing's type contract wipes the PIN here.
+
+		fs::write(&path, b"123456\xffsecret").unwrap();
+		let error = super::read_secret_utf8(&path).unwrap_err();
+		assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+		assert!(!error.to_string().contains("123456"));
+		assert!(!error.to_string().contains("secret"));
+		fs::remove_file(&path).unwrap();
+	}
+
+	#[test]
+	fn zeroizes_master_seed_hex_on_success_and_error() {
+		fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+		assert_zeroize_on_drop::<Zeroizing<String>>();
+
+		let path = std::env::temp_dir()
+			.join(format!("qos-zeroizing-master-seed-{}", std::process::id()));
+		fs::write(&path, "deadbeef").unwrap();
+
+		{
+			let value = super::read_master_seed_hex(&path).unwrap();
+			assert_eq!(&*value, "deadbeef");
+		} // Zeroizing's type contract wipes the seed here.
+		fs::write(&path, b"deadbeef\xffsecret").unwrap();
+		let error = super::read_master_seed_hex(&path).unwrap_err();
+		assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+		assert!(!error.to_string().contains("deadbeef"));
+		assert!(!error.to_string().contains("secret"));
+		fs::remove_file(&path).unwrap();
+	}
+
+	#[test]
+	fn boot_genesis_client_rejects_modified_echoed_request() {
+		let requested_set = GenesisSet {
+			members: vec![QuorumMember {
+				alias: "member-1".to_string(),
+				pub_key: P256Pair::generate().unwrap().public_key().to_bytes(),
+			}],
+			threshold: 1,
+		};
+		let requested_dr_key = Some(vec![7, 8, 9]);
+		let mut output = GenesisOutput {
+			set: requested_set.clone(),
+			dr_key: requested_dr_key.clone(),
+			quorum_key: vec![],
+			member_outputs: vec![],
+			recovery_permutations: vec![],
+			dr_key_wrapped_quorum_key: None,
+			quorum_key_hash: [0; 64],
+			test_message_ciphertext: vec![],
+			test_message_signature: vec![],
+			test_message: vec![],
+		};
+
+		assert!(
+			super::validate_genesis_output_matches_request(
+				&output,
+				&requested_set,
+				requested_dr_key.as_deref(),
+			)
+			.is_ok()
+		);
+
+		output.set.threshold = 2;
+		assert!(matches!(
+			super::validate_genesis_output_matches_request(
+				&output,
+				&requested_set,
+				requested_dr_key.as_deref(),
+			),
+			Err(super::Error::GenesisOutputDoesNotMatchRequest)
+		));
+
+		output.set = requested_set.clone();
+		output.dr_key = None;
+		assert!(matches!(
+			super::validate_genesis_output_matches_request(
+				&output,
+				&requested_set,
+				requested_dr_key.as_deref(),
+			),
+			Err(super::Error::GenesisOutputDoesNotMatchRequest)
+		));
+	}
+
 	struct Setup {
-		manifest: Manifest,
+		manifest: VersionedManifest,
 		manifest_set: ManifestSet,
 		share_set: ShareSet,
 		nitro_config: NitroConfig,
 		pivot_hash: Vec<u8>,
 		quorum_key: P256Public,
-		manifest_envelope: ManifestEnvelope,
+		manifest_envelope: VersionedManifestEnvelope,
 		patch_set: PatchSet,
 	}
 	fn setup() -> Setup {
@@ -2381,7 +2914,7 @@ mod tests {
 		let pivot_hash = vec![5; 32];
 		let quorum_key: P256Public = P256Pair::generate().unwrap().public_key();
 
-		let manifest = Manifest {
+		let manifest_v1 = Manifest {
 			namespace: Namespace {
 				name: "test-namespace".to_string(),
 				nonce: 2,
@@ -2401,20 +2934,22 @@ mod tests {
 			patch_set: patch_set.clone(),
 			enclave: nitro_config.clone(),
 		};
+		let manifest = VersionedManifest::V1(manifest_v1.clone());
 
-		let manifest_envelope = ManifestEnvelope {
-			manifest: manifest.clone(),
-			manifest_set_approvals: std::iter::zip(
-				pairs[..2].iter(),
-				members.iter(),
-			)
-			.map(|(pair, member)| Approval {
-				signature: pair.sign(&manifest.qos_hash()).unwrap(),
-				member: member.clone(),
-			})
-			.collect(),
-			share_set_approvals: vec![],
-		};
+		let manifest_envelope =
+			VersionedManifestEnvelope::V1(ManifestEnvelope {
+				manifest: manifest_v1.clone(),
+				manifest_set_approvals: std::iter::zip(
+					pairs[..2].iter(),
+					members.iter(),
+				)
+				.map(|(pair, member)| Approval {
+					signature: pair.sign(&manifest_v1.qos_hash()).unwrap(),
+					member: member.clone(),
+				})
+				.collect(),
+				share_set_approvals: vec![],
+			});
 
 		Setup {
 			manifest,
@@ -2426,6 +2961,114 @@ mod tests {
 			manifest_envelope,
 			patch_set,
 		}
+	}
+
+	/// Return the v1 manifest for tests that intentionally build v1 fixtures.
+	///
+	/// # Panics
+	///
+	/// Panics if the fixture is not a v1 manifest.
+	fn v1_manifest(manifest: &VersionedManifest) -> &Manifest {
+		match manifest {
+			VersionedManifest::V1(manifest) => manifest,
+			_ => panic!("expected v1 manifest in test setup"),
+		}
+	}
+
+	/// Build a v2 manifest mirroring the v1 test fixture, with optional DNS
+	/// resolver configuration.
+	///
+	/// # Panics
+	///
+	/// Panics if the fixture is not a v1 manifest.
+	fn v2_manifest_from(
+		manifest: &VersionedManifest,
+		dns: Option<DnsConfig>,
+	) -> VersionedManifest {
+		let manifest = v1_manifest(manifest).clone();
+		VersionedManifest::V2(ManifestV2 {
+			version: ManifestVersion::V2,
+			namespace: manifest.namespace,
+			pivot: PivotConfigV2 {
+				hash: manifest.pivot.hash,
+				restart: manifest.pivot.restart,
+				bridge_config: manifest.pivot.bridge_config,
+				debug_mode: manifest.pivot.debug_mode,
+				args: manifest.pivot.args,
+				env: PivotEnv::new(),
+			},
+			manifest_set: manifest.manifest_set,
+			share_set: manifest.share_set,
+			enclave: manifest.enclave,
+			dns,
+		})
+	}
+
+	/// Return the v1 manifest envelope for tests that intentionally build v1 fixtures.
+	///
+	/// # Panics
+	///
+	/// Panics if the fixture is not a v1 manifest envelope.
+	fn v1_manifest_envelope(
+		envelope: &VersionedManifestEnvelope,
+	) -> &ManifestEnvelope {
+		match envelope {
+			VersionedManifestEnvelope::V1(envelope) => envelope,
+			_ => panic!("expected v1 manifest envelope in test setup"),
+		}
+	}
+
+	/// Return a mutable v1 manifest envelope for tests that intentionally build
+	/// v1 fixtures.
+	///
+	/// # Panics
+	///
+	/// Panics if the fixture is not a v1 manifest envelope.
+	fn v1_manifest_envelope_mut(
+		envelope: &mut VersionedManifestEnvelope,
+	) -> &mut ManifestEnvelope {
+		match envelope {
+			VersionedManifestEnvelope::V1(envelope) => envelope,
+			_ => panic!("expected v1 manifest envelope in test setup"),
+		}
+	}
+
+	#[test]
+	fn manifest_envelope_protocol_encodings_try_v1_borsh_first() {
+		let Setup { manifest_envelope, .. } = setup();
+		let manifest =
+			v1_manifest_envelope(&manifest_envelope).manifest.clone();
+
+		assert_eq!(
+			super::manifest_envelope_protocol_encodings(&manifest_envelope),
+			[ProtocolMsgEncoding::Borsh, ProtocolMsgEncoding::Json]
+		);
+
+		let v2_envelope = VersionedManifestEnvelope::V2(ManifestEnvelopeV2 {
+			manifest: ManifestV2 {
+				version: ManifestVersion::V2,
+				namespace: manifest.namespace,
+				pivot: PivotConfigV2 {
+					hash: manifest.pivot.hash,
+					restart: manifest.pivot.restart,
+					bridge_config: manifest.pivot.bridge_config,
+					debug_mode: manifest.pivot.debug_mode,
+					args: manifest.pivot.args,
+					env: PivotEnv::new(),
+				},
+				manifest_set: manifest.manifest_set,
+				share_set: manifest.share_set,
+				enclave: manifest.enclave,
+				dns: None,
+			},
+			manifest_set_approvals: vec![],
+			share_set_approvals: vec![],
+		});
+
+		assert_eq!(
+			super::manifest_envelope_protocol_encodings(&v2_envelope),
+			[ProtocolMsgEncoding::Json]
+		);
 	}
 
 	mod approve_manifest_programmatic_verifications {
@@ -2448,7 +3091,7 @@ mod tests {
 				&manifest,
 				&manifest_set,
 				&share_set,
-				&patch_set,
+				Some(&patch_set),
 				&nitro_config,
 				&pivot_hash,
 				&quorum_key,
@@ -2475,7 +3118,7 @@ mod tests {
 				&manifest,
 				&manifest_set,
 				&share_set,
-				&patch_set,
+				Some(&patch_set),
 				&nitro_config,
 				&pivot_hash,
 				&quorum_key,
@@ -2502,7 +3145,7 @@ mod tests {
 				&manifest,
 				&manifest_set,
 				&share_set,
-				&patch_set,
+				Some(&patch_set),
 				&nitro_config,
 				&pivot_hash,
 				&quorum_key,
@@ -2528,7 +3171,7 @@ mod tests {
 				&manifest,
 				&manifest_set,
 				&share_set,
-				&patch_set,
+				Some(&patch_set),
 				&nitro_config,
 				&pivot_hash,
 				&quorum_key,
@@ -2554,7 +3197,7 @@ mod tests {
 				&manifest,
 				&manifest_set,
 				&share_set,
-				&patch_set,
+				Some(&patch_set),
 				&nitro_config,
 				&pivot_hash,
 				&quorum_key,
@@ -2580,7 +3223,7 @@ mod tests {
 				&manifest,
 				&manifest_set,
 				&share_set,
-				&patch_set,
+				Some(&patch_set),
 				&nitro_config,
 				&pivot_hash,
 				&quorum_key,
@@ -2606,7 +3249,7 @@ mod tests {
 				&manifest,
 				&manifest_set,
 				&share_set,
-				&patch_set,
+				Some(&patch_set),
 				&nitro_config,
 				&pivot_hash,
 				&quorum_key,
@@ -2632,7 +3275,7 @@ mod tests {
 				&manifest,
 				&manifest_set,
 				&share_set,
-				&patch_set,
+				Some(&patch_set),
 				&nitro_config,
 				&pivot_hash,
 				&quorum_key,
@@ -2658,7 +3301,7 @@ mod tests {
 				&manifest,
 				&manifest_set,
 				&share_set,
-				&patch_set,
+				Some(&patch_set),
 				&nitro_config,
 				&pivot_hash,
 				&quorum_key,
@@ -2684,7 +3327,7 @@ mod tests {
 				&manifest,
 				&manifest_set,
 				&share_set,
-				&patch_set,
+				Some(&patch_set),
 				&nitro_config,
 				&pivot_hash,
 				&quorum_key,
@@ -2710,7 +3353,7 @@ mod tests {
 				&manifest,
 				&manifest_set,
 				&share_set,
-				&patch_set,
+				Some(&patch_set),
 				&nitro_config,
 				&pivot_hash,
 				&quorum_key,
@@ -2721,11 +3364,15 @@ mod tests {
 	mod approve_manifest_human_verifications {
 		use super::*;
 		#[test]
-		fn human_verification_works() {
+		fn approval_view_includes_schema_debug_bridges_and_dns() {
 			let Setup { manifest, .. } = setup();
+			let manifest = v2_manifest_from(
+				&manifest,
+				Some(DnsConfig { resolvers: vec!["1.1.1.1".parse().unwrap()] }),
+			);
 
 			let mut vec_out = Vec::<u8>::new();
-			let vec_in = "yes\nyes\nyes\nyes\nyes\n".as_bytes();
+			let vec_in = "yes\nyes\nyes\nyes\nyes\nyes\nyes\nyes\n".as_bytes();
 
 			let mut prompter =
 				Prompter { reader: vec_in, writer: &mut vec_out };
@@ -2734,6 +3381,12 @@ mod tests {
 				&manifest,
 				&mut prompter
 			));
+
+			let output = String::from_utf8(vec_out).unwrap();
+			assert!(output.contains("manifest schema version: v2"));
+			assert!(output.contains("pivot debug mode: false"));
+			assert!(output.contains("pivot bridge configuration"));
+			assert!(output.contains("correct DNS resolvers"));
 		}
 
 		#[test]
@@ -2741,29 +3394,7 @@ mod tests {
 			let Setup { manifest, .. } = setup();
 
 			let mut vec_out: Vec<u8> = vec![];
-			let vec_in = "No\n".as_bytes();
-
-			let mut prompter =
-				Prompter { reader: vec_in, writer: &mut vec_out };
-
-			assert!(!super::approve_manifest_human_verifications(
-				&manifest,
-				&mut prompter
-			));
-
-			let output = String::from_utf8(vec_out).unwrap();
-			assert_eq!(
-				&output,
-				"Is this the correct namespace name: test-namespace? (y/n)\n"
-			);
-		}
-
-		#[test]
-		fn exits_early_with_bad_namespace_nonce() {
-			let Setup { manifest, .. } = setup();
-
-			let mut vec_out: Vec<u8> = vec![];
-			let vec_in = "yes\nye".as_bytes();
+			let vec_in = "yes\nNo\n".as_bytes();
 
 			let mut prompter =
 				Prompter { reader: vec_in, writer: &mut vec_out };
@@ -2778,16 +3409,16 @@ mod tests {
 
 			assert_eq!(
 				output[1],
-				"Is this the correct namespace nonce: 2? (y/n)"
+				"Is this the correct namespace name: test-namespace? (y/n)"
 			);
 		}
 
 		#[test]
-		fn exits_early_with_bad_restart_policy() {
+		fn exits_early_with_bad_namespace_nonce() {
 			let Setup { manifest, .. } = setup();
 
 			let mut vec_out: Vec<u8> = vec![];
-			let vec_in = "yes\nyes\ny".as_bytes();
+			let vec_in = "yes\nyes\nye".as_bytes();
 
 			let mut prompter =
 				Prompter { reader: vec_in, writer: &mut vec_out };
@@ -2802,12 +3433,12 @@ mod tests {
 
 			assert_eq!(
 				output[2],
-				"Is this the correct pivot restart policy: RestartPolicy::Never? (y/n)"
+				"Is this the correct namespace nonce: 2? (y/n)"
 			);
 		}
 
 		#[test]
-		fn exits_early_with_bad_pivot_args() {
+		fn exits_early_with_bad_restart_policy() {
 			let Setup { manifest, .. } = setup();
 
 			let mut vec_out: Vec<u8> = vec![];
@@ -2824,9 +3455,145 @@ mod tests {
 			let output = String::from_utf8(vec_out).unwrap();
 			let output: Vec<_> = output.split('\n').collect();
 
-			assert_eq!(output[3], "Are these the correct pivot args:");
-			assert_eq!(output[4], "[\"--option1\", \"argument\"]?");
-			assert_eq!(output[5], "(y/n)");
+			assert_eq!(
+				output[3],
+				"Is this the correct pivot restart policy: RestartPolicy::Never? (y/n)"
+			);
+		}
+
+		#[test]
+		fn exits_early_with_bad_pivot_args() {
+			let Setup { manifest, .. } = setup();
+
+			let mut vec_out: Vec<u8> = vec![];
+			let vec_in = "yes\nyes\nyes\nyes\nno".as_bytes();
+
+			let mut prompter =
+				Prompter { reader: vec_in, writer: &mut vec_out };
+
+			assert!(!super::approve_manifest_human_verifications(
+				&manifest,
+				&mut prompter
+			));
+
+			let output = String::from_utf8(vec_out).unwrap();
+			let output: Vec<_> = output.split('\n').collect();
+
+			assert_eq!(output[4], "Are these the correct pivot args:");
+			assert_eq!(output[5], "[\"--option1\", \"argument\"]?");
+			assert_eq!(output[6], "(y/n)");
+		}
+
+		#[test]
+		fn exits_early_with_bad_manifest_schema_version() {
+			let Setup { manifest, .. } = setup();
+
+			let mut vec_out: Vec<u8> = vec![];
+			let vec_in = "no\n".as_bytes();
+
+			let mut prompter =
+				Prompter { reader: vec_in, writer: &mut vec_out };
+
+			assert!(!super::approve_manifest_human_verifications(
+				&manifest,
+				&mut prompter
+			));
+
+			let output = String::from_utf8(vec_out).unwrap();
+			let output: Vec<_> = output.split('\n').collect();
+
+			assert_eq!(
+				output[0],
+				"Is this the correct manifest schema version: v1? (y/n)"
+			);
+		}
+
+		#[test]
+		fn exits_early_with_bad_debug_mode() {
+			let Setup { manifest, .. } = setup();
+
+			let mut vec_out: Vec<u8> = vec![];
+			let vec_in = "yes\nyes\nyes\nyes\nyes\nno".as_bytes();
+
+			let mut prompter =
+				Prompter { reader: vec_in, writer: &mut vec_out };
+
+			assert!(!super::approve_manifest_human_verifications(
+				&manifest,
+				&mut prompter
+			));
+
+			let output = String::from_utf8(vec_out).unwrap();
+			let output: Vec<_> = output.split('\n').collect();
+
+			assert_eq!(
+				output[7],
+				"Is this the correct pivot debug mode: false? (y/n)"
+			);
+		}
+
+		#[test]
+		fn exits_early_with_bad_bridge_config() {
+			let Setup { manifest, .. } = setup();
+
+			let mut vec_out: Vec<u8> = vec![];
+			let vec_in = "yes\nyes\nyes\nyes\nyes\nyes\nno".as_bytes();
+
+			let mut prompter =
+				Prompter { reader: vec_in, writer: &mut vec_out };
+
+			assert!(!super::approve_manifest_human_verifications(
+				&manifest,
+				&mut prompter
+			));
+
+			let output = String::from_utf8(vec_out).unwrap();
+			let output: Vec<_> = output.split('\n').collect();
+
+			assert_eq!(
+				output[8],
+				"Is this the correct pivot bridge configuration:"
+			);
+			assert_eq!(output[9], "[]?");
+			assert_eq!(output[10], "(y/n)");
+		}
+
+		#[test]
+		fn prompts_each_v2_dns_configuration() {
+			for (dns, expected) in [
+				(None, "Is this the correct DNS configuration: absent? (y/n)"),
+				(
+					Some(DnsConfig { resolvers: vec![] }),
+					"Is this the correct DNS configuration: configured with no resolvers? (y/n)",
+				),
+				(
+					Some(DnsConfig {
+						resolvers: vec!["1.1.1.1".parse().unwrap()],
+					}),
+					"Are these the correct DNS resolvers:",
+				),
+			] {
+				let Setup { manifest, .. } = setup();
+				let manifest = v2_manifest_from(&manifest, dns);
+
+				let mut vec_out: Vec<u8> = vec![];
+				let vec_in = "yes\nyes\nyes\nyes\nyes\nyes\nyes\nno".as_bytes();
+				let mut prompter =
+					Prompter { reader: vec_in, writer: &mut vec_out };
+
+				assert!(!approve_manifest_human_verifications(
+					&manifest,
+					&mut prompter
+				));
+
+				let output = String::from_utf8(vec_out).unwrap();
+				let output: Vec<_> = output.split('\n').collect();
+				assert_eq!(
+					output[0],
+					"Is this the correct manifest schema version: v2? (y/n)"
+				);
+				assert_eq!(output[11], expected);
+			}
 		}
 	}
 
@@ -2852,7 +3619,7 @@ mod tests {
 				manifest_set, share_set, mut manifest_envelope, ..
 			} = setup();
 
-			manifest_envelope
+			v1_manifest_envelope_mut(&mut manifest_envelope)
 				.manifest_set_approvals
 				.get_mut(0)
 				.unwrap()
@@ -2872,7 +3639,7 @@ mod tests {
 				manifest_set, share_set, mut manifest_envelope, ..
 			} = setup();
 
-			manifest_envelope
+			v1_manifest_envelope_mut(&mut manifest_envelope)
 				.manifest_set_approvals
 				.get_mut(0)
 				.unwrap()
@@ -2893,7 +3660,10 @@ mod tests {
 				manifest_set, share_set, mut manifest_envelope, ..
 			} = setup();
 
-			manifest_envelope.manifest_set_approvals.pop().unwrap();
+			v1_manifest_envelope_mut(&mut manifest_envelope)
+				.manifest_set_approvals
+				.pop()
+				.unwrap();
 
 			let member = share_set.members[0].clone();
 			assert!(!proxy_re_encrypt_share_programmatic_verifications(
@@ -2964,16 +3734,16 @@ mod tests {
 			assert_eq!(
 				output,
 				vec![
-				"Is this the correct namespace name: test-namespace? (y/n)",
-				"Is this the correct namespace nonce: 2? (y/n)",
-				"Does this AWS IAM role belong to the intended organization: pr3? (y/n)",
-				"Please answer with either \"yes\" (y) or \"no\" (n)",
-				"Please answer with either \"yes\" (y) or \"no\" (n)",
-				"The following manifest set members approved:",
-				"\talias: 0",
-				"\talias: 1",
-				"Is this ok? (y/n)",
-			]
+					"Is this the correct namespace name: test-namespace? (y/n)",
+					"Is this the correct namespace nonce: 2? (y/n)",
+					"Does this AWS IAM role belong to the intended organization: pr3? (y/n)",
+					"Please answer with either \"yes\" (y) or \"no\" (n)",
+					"Please answer with either \"yes\" (y) or \"no\" (n)",
+					"The following manifest set members approved:",
+					"\talias: 0",
+					"\talias: 1",
+					"Is this ok? (y/n)",
+				]
 			);
 		}
 
@@ -3107,10 +3877,50 @@ mod tests {
 		}
 	}
 
+	mod pcr3_preimage_verification {
+		use super::super::{
+			Error, check_pcr3_preimage_against_manifest, pcr3_from_preimage,
+		};
+
+		const ROLE_ARN: &str = "arn:aws:iam::123456789012:role/Webserver";
+		const EXPECTED_PCR3_HEX: &str = "78fce75db17cd4e0a3fb8dad3ad128ca5e77edbb2b2c7f75329dccd99aa5f6ef4fc1f1a452e315b9e98f9e312e6921e6";
+
+		#[test]
+		fn pcr3_from_preimage_derives_expected_pcr3() {
+			assert_eq!(
+				pcr3_from_preimage(ROLE_ARN),
+				qos_hex::decode(EXPECTED_PCR3_HEX).unwrap()
+			);
+		}
+
+		#[test]
+		fn rejects_manifest_pcr3_mismatch() {
+			let manifest_pcr3 = pcr3_from_preimage(ROLE_ARN);
+			assert!(
+				check_pcr3_preimage_against_manifest(ROLE_ARN, &manifest_pcr3)
+					.is_ok()
+			);
+			match check_pcr3_preimage_against_manifest(ROLE_ARN, &[4u8; 48]) {
+				Err(Error::Pcr3PreimageDoesNotMatchManifest {
+					manifest_pcr3,
+					file_pcr3,
+				}) => {
+					assert_eq!(manifest_pcr3, qos_hex::encode(&[4u8; 48]));
+					assert_eq!(file_pcr3, EXPECTED_PCR3_HEX);
+				}
+				other => panic!("unexpected result: {other:?}"),
+			}
+		}
+	}
+
 	mod json_to_borsh {
 		use std::fs;
 
 		use borsh::BorshDeserialize;
+		use qos_core::protocol::services::boot::{
+			ManifestEnvelopeV2, ManifestV2, ManifestVersion, PivotConfigV2,
+			PivotEnv,
+		};
 
 		use super::*;
 		use crate::cli::DisplayType;
@@ -3138,7 +3948,7 @@ mod tests {
 			// Read back and verify
 			let borsh_bytes = fs::read(&borsh_path).unwrap();
 			let decoded = Manifest::try_from_slice(&borsh_bytes).unwrap();
-			assert_eq!(decoded, manifest);
+			assert_eq!(decoded, *v1_manifest(&manifest));
 
 			// Cleanup
 			let _ = fs::remove_file(&json_path);
@@ -3169,7 +3979,7 @@ mod tests {
 			let borsh_bytes = fs::read(&borsh_path).unwrap();
 			let decoded =
 				ManifestEnvelope::try_from_slice(&borsh_bytes).unwrap();
-			assert_eq!(decoded, manifest_envelope);
+			assert_eq!(decoded, *v1_manifest_envelope(&manifest_envelope));
 
 			// Cleanup
 			let _ = fs::remove_file(&json_path);
@@ -3195,6 +4005,97 @@ mod tests {
 
 			// Cleanup
 			let _ = fs::remove_file(&json_path);
+		}
+
+		#[test]
+		fn rejects_v2_json_manifest() {
+			let Setup { manifest, .. } = setup();
+			let manifest = v1_manifest(&manifest).clone();
+			let temp_dir = std::env::temp_dir();
+			let json_path =
+				PathWrapper::from(temp_dir.join("test_manifest_v2.json"));
+			let borsh_path =
+				PathWrapper::from(temp_dir.join("test_manifest_v2.borsh"));
+			let v2 = ManifestV2 {
+				version: ManifestVersion::V2,
+				namespace: manifest.namespace,
+				pivot: PivotConfigV2 {
+					hash: manifest.pivot.hash,
+					restart: manifest.pivot.restart,
+					bridge_config: manifest.pivot.bridge_config,
+					debug_mode: manifest.pivot.debug_mode,
+					args: manifest.pivot.args,
+					env: PivotEnv::new(),
+				},
+				manifest_set: manifest.manifest_set,
+				share_set: manifest.share_set,
+				enclave: manifest.enclave,
+				dns: None,
+			};
+			fs::write(&json_path, qos_json::to_vec(&v2).unwrap()).unwrap();
+
+			let result = super::super::json_to_borsh(
+				&DisplayType::Manifest,
+				&json_path,
+				&borsh_path,
+			);
+
+			assert!(matches!(
+				result,
+				Err(super::super::Error::ManifestV2NotConvertibleToBorsh)
+			));
+		}
+
+		#[test]
+		fn rejects_v2_json_manifest_envelope() {
+			let Setup { manifest_envelope, .. } = setup();
+			let manifest_envelope = v1_manifest_envelope(&manifest_envelope);
+			let manifest = manifest_envelope.manifest.clone();
+			let temp_dir = std::env::temp_dir();
+			let json_path = PathWrapper::from(
+				temp_dir.join("test_manifest_envelope_v2.json"),
+			);
+			let borsh_path = PathWrapper::from(
+				temp_dir.join("test_manifest_envelope_v2.borsh"),
+			);
+			let v2_manifest = ManifestV2 {
+				version: ManifestVersion::V2,
+				namespace: manifest.namespace,
+				pivot: PivotConfigV2 {
+					hash: manifest.pivot.hash,
+					restart: manifest.pivot.restart,
+					bridge_config: manifest.pivot.bridge_config,
+					debug_mode: manifest.pivot.debug_mode,
+					args: manifest.pivot.args,
+					env: PivotEnv::new(),
+				},
+				manifest_set: manifest.manifest_set,
+				share_set: manifest.share_set,
+				enclave: manifest.enclave,
+				dns: None,
+			};
+			let v2_envelope = ManifestEnvelopeV2 {
+				manifest: v2_manifest,
+				manifest_set_approvals: manifest_envelope
+					.manifest_set_approvals
+					.clone(),
+				share_set_approvals: manifest_envelope
+					.share_set_approvals
+					.clone(),
+			};
+			fs::write(&json_path, qos_json::to_vec(&v2_envelope).unwrap())
+				.unwrap();
+
+			let result = super::super::json_to_borsh(
+				&DisplayType::ManifestEnvelope,
+				&json_path,
+				&borsh_path,
+			);
+
+			assert!(matches!(
+				result,
+				Err(super::super::Error::ManifestV2NotConvertibleToBorsh)
+			));
 		}
 	}
 

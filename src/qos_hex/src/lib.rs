@@ -1,25 +1,4 @@
-//! Utilities for encoding and decoding hex strings.
-//!
-//! To encode a `&[u8]` you can use:
-//!
-//! - [`encode`]
-//! - [`encode_to_vec`]
-//!
-//! To decode you can use:
-//!
-//! - [`decode`] for `&str`
-//! - [`decode_from_vec`] for `Vec<u8>`
-//! - [`FromHex::from_hex`] for `Vec<u8>` and some `u8` array sizes.
-//! - [`decode_to_buf`] for decoding a `&str` into a `&mut [u8]` with the exact
-//!   size.
-//!
-//! # Features
-//!
-//! ## `serde`
-//!
-//! With the serde feature enabled you can use [`crate::serde`] to serialize any
-//! `u8` array or `Vec<u8>` to hex and deserialize hex string to a `Vec<u8>` and
-//! a fixed selection of `u8` arrays.
+#![doc = include_str!("../README.md")]
 
 use std::{convert::Into, num::ParseIntError, string::FromUtf8Error};
 
@@ -121,7 +100,9 @@ pub fn decode(raw_s: &str) -> Result<Vec<u8>, HexError> {
 					verify_ascii(sanitized_s_bytes[i + 1])?;
 
 					let s = std::str::from_utf8(&sanitized_s_bytes[i..i + 2])
-						.expect("We ensure that input slice represents ASCII above. qed.");
+						.expect(
+							"We ensure that input slice represents ASCII above. qed.",
+						);
 					u8::from_str_radix(s, 16).map_err(Into::into)
 				})
 				.collect()
@@ -265,9 +246,9 @@ from_hex_array_impl! {
 pub mod serde {
 	use core::{fmt, marker::PhantomData};
 
-	use serde::{de::Visitor, Deserializer, Serializer};
+	use serde::{Deserializer, Serializer, de::Visitor};
 
-	use super::{encode, FromHex};
+	use super::{FromHex, encode};
 
 	/// Serialize bytes as a hex string.
 	///
@@ -327,6 +308,53 @@ pub mod serde {
 		}
 
 		deserializer.deserialize_str(StrVisitor(PhantomData))
+	}
+
+	/// Serde support for `Option<T>` where `T` is hex-encoded bytes.
+	pub mod option {
+		use super::{Deserializer, FromHex, Serializer, encode};
+		use serde::{Deserialize, Serialize};
+
+		/// Serialize optional bytes as an optional hex string.
+		///
+		/// # Errors
+		///
+		/// Returns the serializer's error type if serialization fails.
+		pub fn serialize<T, S>(
+			value: &Option<T>,
+			serializer: S,
+		) -> Result<S::Ok, S::Error>
+		where
+			T: AsRef<[u8]>,
+			S: Serializer,
+		{
+			value
+				.as_ref()
+				.map(|bytes| encode(bytes.as_ref()))
+				.serialize(serializer)
+		}
+
+		/// Deserialize an optional hex string into optional bytes.
+		///
+		/// # Errors
+		///
+		/// Returns the deserializer's error type if the input is not `null`
+		/// or a valid hex string.
+		pub fn deserialize<'de, D, T>(
+			deserializer: D,
+		) -> Result<Option<T>, D::Error>
+		where
+			D: Deserializer<'de>,
+			T: FromHex,
+		{
+			Option::<String>::deserialize(deserializer)?
+				.as_deref()
+				.map(FromHex::from_hex)
+				.map(|res| {
+					res.map_err(|e| serde::de::Error::custom(format!("{e:?}")))
+				})
+				.transpose()
+		}
 	}
 }
 

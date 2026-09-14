@@ -47,17 +47,22 @@ impl RequestProcessor for Processor {
 				let server_name: rustls::pki_types::ServerName<'_> =
 					host.clone().try_into().unwrap();
 				let config: rustls::ClientConfig =
-					rustls::ClientConfig::builder()
-						.with_root_certificates(root_store)
-						.with_no_client_auth();
+					rustls::ClientConfig::builder_with_provider(Arc::new(
+						rustls::crypto::aws_lc_rs::default_provider(),
+					))
+					.with_safe_default_protocol_versions()
+					.unwrap()
+					.with_root_certificates(root_store)
+					.with_no_client_auth();
 				let conn = TlsConnector::from(Arc::new(config));
 				let mut tls = conn
 					.connect(server_name, &mut stream)
 					.await
 					.expect("tls unable to establish connection");
 
-				let http_request =
-					format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+				let http_request = format!(
+					"GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+				);
 
 				tls.write_all(http_request.as_bytes()).await.unwrap();
 

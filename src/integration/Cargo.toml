@@ -14,6 +14,9 @@ unsafe_code = "deny"
 missing_errors_doc = "allow"
 module_name_repetitions = "allow"
 
+[features]
+legacy-protocol-compat = []
+
 [dependencies]
 qos_core = { workspace = true, features = ["mock"], default-features = false }
 qos_nsm = { workspace = true, features = ["mock"], default-features = false }
@@ -23,16 +26,23 @@ qos_crypto = { workspace = true }
 qos_hex = { workspace = true }
 qos_p256 = { workspace = true, features = ["mock"] }
 qos_test_primitives = { workspace = true }
+zeroize = { workspace = true }
 
+axum = { workspace = true, default-features = false, features = ["http1", "json"] }
 futures = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs"] }
 borsh = { workspace = true }
 nix = { workspace = true }
 rustls = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 webpki-roots = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs"] }
 tokio-rustls = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true, features = ["thread_rng"] }
 ureq = { workspace = true, features = ["json"] }
+qos_core_legacy = { package = "qos_core", version = "0.7", default-features = false }
+# src/bin/pivot_download.rs to test egress
+sha2 = { workspace = true }
+url = { workspace = true }

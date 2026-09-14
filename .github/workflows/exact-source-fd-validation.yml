@@ -1,0 +1,54 @@
+name: Exact-source Linux FD validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact 40-character lowercase source commit SHA
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_SHA: ${{ inputs.source_sha }}
+
+jobs:
+  fd-gate:
+    name: Exact-source qos_enclave FD gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout workflow controller
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          path: controller
+          persist-credentials: false
+
+      - name: Reject malformed source SHA
+        run: controller/.github/scripts/exact-source-fd-gate.sh validate-sha
+
+      - name: Checkout exact source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          path: source
+          persist-credentials: false
+
+      - name: Install native build prerequisites
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          build-essential clang libclang-dev llvm-dev cmake pkg-config libssl-dev
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: "1.94"
+
+      - name: Run exact-source FD gate
+        env:
+          SOURCE_DIR: ${{ github.workspace }}/source
+          CONTROLLER_DIR: ${{ github.workspace }}/controller
+        run: '"${CONTROLLER_DIR}/.github/scripts/exact-source-fd-gate.sh" run'

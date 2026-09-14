@@ -7,14 +7,41 @@ use qos_nsm::types::NsmResponse;
 use qos_p256::{P256Pair, P256Public};
 
 use crate::protocol::{
-	services::attestation, Hash256, ProtocolError, ProtocolState, QosHash,
+	Hash256, ProtocolError, ProtocolState, QosHash, services::attestation,
 };
 
 pub mod env;
+pub mod manifest;
 pub use env::{
-	PivotEnv, PivotEnvValue, PivotEnvVarName, MAX_PIVOT_ENV_NAME_LEN,
-	MAX_PIVOT_ENV_VALUE_LEN, MAX_PIVOT_ENV_VARS,
+	MAX_PIVOT_ENV_NAME_LEN, MAX_PIVOT_ENV_VALUE_LEN, MAX_PIVOT_ENV_VARS,
+	PivotEnv, PivotEnvValue, PivotEnvVarName,
 };
+pub use manifest::v2::{
+	DnsConfig, ManifestEnvelopeV2, ManifestV2, PivotConfigV2,
+};
+pub use manifest::{
+	ManifestBuilder, ManifestBuilderError, ManifestVersion, VersionedManifest,
+	VersionedManifestEnvelope,
+};
+
+fn decode_borsh<T, U, V>(
+	buf: &[u8],
+	current: impl FnOnce(T) -> V,
+	legacy: impl FnOnce(U) -> V,
+) -> Result<V, borsh::io::Error>
+where
+	T: borsh::BorshDeserialize,
+	U: borsh::BorshDeserialize,
+{
+	match (T::try_from_slice(buf), U::try_from_slice(buf)) {
+		(Ok(_), Ok(_)) => {
+			Err(borsh::io::Error::other("ambiguous borsh encoding"))
+		}
+		(Ok(value), Err(_)) => Ok(current(value)),
+		(Err(_), Ok(value)) => Ok(legacy(value)),
+		(Err(error), Err(_)) => Err(error),
+	}
+}
 
 /// Enclave configuration specific to AWS Nitro.
 #[derive(
@@ -72,8 +99,10 @@ impl fmt::Debug for NitroConfig {
 	serde::Serialize,
 	serde::Deserialize,
 )]
+#[cfg_attr(any(feature = "mock", test), derive(Default))]
 pub enum RestartPolicy {
 	/// Never restart the pivot application
+	#[cfg_attr(any(feature = "mock", test), default)]
 	Never,
 	/// Always restart the pivot application
 	Always,
@@ -86,13 +115,6 @@ impl fmt::Debug for RestartPolicy {
 			Self::Always => write!(f, "RestartPolicy::Always")?,
 		}
 		Ok(())
-	}
-}
-
-#[cfg(any(feature = "mock", test))]
-impl Default for RestartPolicy {
-	fn default() -> Self {
-		Self::Never
 	}
 }
 
@@ -112,6 +134,7 @@ impl TryFrom<String> for RestartPolicy {
 #[derive(
 	PartialEq,
 	Eq,
+	Debug,
 	Clone,
 	serde::Serialize,
 	serde::Deserialize,
@@ -124,6 +147,7 @@ pub enum BridgeConfig {
 	/// Server hosting bridge, connections go INTO the enclave app on given port and host binding
 	Server {
 		/// The port to listen on, matching on host and app sides
+		#[serde(with = "qos_json::string_or_numeric")]
 		port: u16,
 		/// The host ip to listen on, use `0.0.0.0` for any
 		host: String,
@@ -133,9 +157,11 @@ pub enum BridgeConfig {
 	/// *NOTE*: currently **unimplemented** and results in boot panic if set.
 	Client {
 		/// Port to connect to when app initiates outgoing connections.
+		#[serde(with = "qos_json::string_or_numeric")]
 		port: u16,
 		/// Host name to connect to when app initiates outgoing connections.
 		/// If `None` an internal protocol is used to determine the destination (**unimplemented**)
+		#[serde(default, skip_serializing_if = "Option::is_none")]
 		host: Option<String>,
 	},
 }
@@ -272,6 +298,33 @@ impl fmt::Debug for QuorumMember {
 	}
 }
 
+/// Ensure that every member has a unique alias, signing public key, and
+/// encryption public key. A duplicate of any of these is a red flag that a
+/// single party controls multiple members.
+///
+/// # Errors
+///
+/// Returns [`ProtocolError::DuplicateQuorumMember`] if any alias or public
+/// key component appears more than once, or an error if a member's public
+/// key cannot be decoded.
+pub(crate) fn ensure_unique_members(
+	members: &[QuorumMember],
+) -> Result<(), ProtocolError> {
+	let mut aliases = HashSet::new();
+	let mut signing_keys = HashSet::new();
+	let mut encryption_keys = HashSet::new();
+	for member in members {
+		let pub_key = P256Public::from_bytes(&member.pub_key)?;
+		if !aliases.insert(&member.alias)
+			|| !signing_keys.insert(pub_key.signing_public_key_bytes())
+			|| !encryption_keys.insert(pub_key.encryption_public_key_bytes())
+		{
+			return Err(ProtocolError::DuplicateQuorumMember);
+		}
+	}
+	Ok(())
+}
+
 /// The Manifest Set.
 #[derive(
 	PartialEq,
@@ -287,6 +340,7 @@ impl fmt::Debug for QuorumMember {
 #[cfg_attr(any(feature = "mock", test), derive(Default))]
 pub struct ManifestSet {
 	/// The threshold, K, of signatures necessary to have quorum.
+	#[serde(with = "qos_json::string_or_numeric")]
 	pub threshold: u32,
 	/// Members composing the set. The length of this, N, must be gte to the
 	/// `threshold`, K.
@@ -308,6 +362,7 @@ pub struct ManifestSet {
 #[cfg_attr(any(feature = "mock", test), derive(Default))]
 pub struct ShareSet {
 	/// The threshold, K, of signatures necessary to have quorum.
+	#[serde(with = "qos_json::string_or_numeric")]
 	pub threshold: u32,
 	/// Members composing the set. The length of this, N, must be gte to the
 	/// `threshold`, K.
@@ -356,6 +411,7 @@ impl fmt::Debug for MemberPubKey {
 #[cfg_attr(any(feature = "mock", test), derive(Default))]
 pub struct PatchSet {
 	/// The threshold, K, of signatures necessary to have quorum.
+	#[serde(with = "qos_json::string_or_numeric")]
 	pub threshold: u32,
 	/// Public keys of members composing the set. The length of this, N, must
 	/// be gte to the `threshold`, K.
@@ -382,6 +438,7 @@ pub struct Namespace {
 	/// manifests for this namespace have been created. This is used to prevent
 	/// downgrade attacks - quorum members should only approve a manifest that
 	/// has the highest nonce.
+	#[serde(with = "qos_json::string_or_numeric")]
 	pub nonce: u32,
 	/// Quorum Key
 	#[serde(with = "qos_hex::serde")]
@@ -443,6 +500,7 @@ pub struct Manifest {
 	Clone,
 	borsh::BorshSerialize,
 	borsh::BorshDeserialize,
+	serde::Serialize,
 	serde::Deserialize,
 )]
 #[serde(rename_all = "camelCase")]
@@ -490,23 +548,16 @@ impl Manifest {
 	/// Returns [`borsh::io::Error`] if deserialization fails for both the
 	/// current and legacy formats.
 	pub fn try_from_slice_compat(buf: &[u8]) -> Result<Self, borsh::io::Error> {
-		use borsh::BorshDeserialize;
-
 		// try old version with json format
 		if let Ok(v0) = serde_json::from_slice::<ManifestV0>(buf) {
 			return Ok(v0.into());
 		}
 
-		let result = Self::try_from_slice(buf);
-
-		// try loading the old version with borsh format
-		if result.is_err() {
-			let old = ManifestV0::try_from_slice(buf)?;
-
-			Ok(old.into())
-		} else {
-			result
-		}
+		decode_borsh(
+			buf,
+			|manifest| manifest,
+			|manifest: ManifestV0| manifest.into(),
+		)
 	}
 }
 
@@ -577,7 +628,14 @@ pub struct ManifestEnvelope {
 
 /// [`ManifestV0`] with accompanying [`Approval`]s.
 #[derive(
-	PartialEq, Eq, Debug, Clone, borsh::BorshSerialize, borsh::BorshDeserialize,
+	PartialEq,
+	Eq,
+	Debug,
+	Clone,
+	borsh::BorshSerialize,
+	borsh::BorshDeserialize,
+	serde::Serialize,
+	serde::Deserialize,
 )]
 #[cfg_attr(any(feature = "mock", test), derive(Default))]
 pub struct ManifestEnvelopeV0 {
@@ -603,6 +661,9 @@ impl ManifestEnvelope {
 	/// [`ProtocolError::NotEnoughApprovals`] if fewer than the threshold
 	/// number of members approved.
 	pub fn check_approvals(&self) -> Result<(), ProtocolError> {
+		ensure_unique_members(&self.manifest.manifest_set.members)?;
+
+		let manifest_hash = self.manifest.qos_hash();
 		let mut uniq_members = HashSet::new();
 		for approval in &self.manifest_set_approvals {
 			let member_pub_key =
@@ -610,7 +671,7 @@ impl ManifestEnvelope {
 
 			// Ensure that this is a valid signature from the member
 			let is_valid_signature = member_pub_key
-				.verify(&self.manifest.qos_hash(), &approval.signature)
+				.verify(&manifest_hash, &approval.signature)
 				.is_ok();
 			if !is_valid_signature {
 				return Err(ProtocolError::InvalidManifestApproval(
@@ -623,10 +684,12 @@ impl ManifestEnvelope {
 				return Err(ProtocolError::NotManifestSetMember);
 			}
 
-			// Ensure that the member only has 1 approval. Note that we don't
-			// include the signature in this check because the signature is
-			// malleable. i.e. there could be two different signatures per
-			// member.
+			// Ensure that the member only has 1 approval. We already checked
+			// at the top of this function that each member has a unique
+			// signing key, so hashing the full member record is sufficient.
+			// Note that we don't include the signature in this check because
+			// the signature is malleable. i.e. there could be two different
+			// signatures per member.
 			if !uniq_members.insert(approval.member.qos_hash()) {
 				return Err(ProtocolError::DuplicateApproval);
 			}
@@ -647,37 +710,30 @@ impl ManifestEnvelope {
 	/// Returns [`borsh::io::Error`] if deserialization fails for both the
 	/// current and legacy formats.
 	pub fn try_from_slice_compat(buf: &[u8]) -> Result<Self, borsh::io::Error> {
-		use borsh::BorshDeserialize;
-
-		let result = Self::try_from_slice(buf);
-
-		// try loading the old version of manifest
-		if result.is_err() {
-			let old = ManifestEnvelopeV0::try_from_slice(buf)?;
-
-			Ok(Self {
+		decode_borsh(
+			buf,
+			|envelope| envelope,
+			|old: ManifestEnvelopeV0| Self {
 				manifest: Manifest::from(old.manifest),
 				manifest_set_approvals: old.manifest_set_approvals,
 				share_set_approvals: old.share_set_approvals,
-			})
-		} else {
-			result
-		}
+			},
+		)
 	}
 }
 
 pub(in crate::protocol::services) fn put_manifest_and_pivot(
 	state: &mut ProtocolState,
-	manifest_envelope: &ManifestEnvelope,
+	manifest_envelope: &VersionedManifestEnvelope,
 	pivot: &[u8],
 ) -> Result<NsmResponse, ProtocolError> {
 	// 1. Check signatures over the manifest envelope.
 	manifest_envelope.check_approvals()?;
-	if !manifest_envelope.share_set_approvals.is_empty() {
+	if !manifest_envelope.share_set_approvals().is_empty() {
 		return Err(ProtocolError::BadShareSetApprovals);
 	}
 	let actual_hash = sha_256(pivot);
-	let expected_hash = manifest_envelope.manifest.pivot.hash;
+	let expected_hash = *manifest_envelope.pivot_hash();
 	if actual_hash != expected_hash {
 		return Err(ProtocolError::InvalidPivotHash {
 			expected: qos_hex::encode(&expected_hash),
@@ -685,32 +741,49 @@ pub(in crate::protocol::services) fn put_manifest_and_pivot(
 		});
 	}
 
-	// 2. Generate an Ephemeral Key.
-	let ephemeral_key = P256Pair::generate()?;
-	state.handles.put_ephemeral_key(&ephemeral_key)?;
+	// 2. Generate the setup key and the post-provision live key.
+	let setup_ephemeral_key = P256Pair::generate()?;
+	let live_ephemeral_key = P256Pair::generate()?;
+	let setup_ephemeral_public_key =
+		setup_ephemeral_key.public_key().to_bytes();
+	let live_ephemeral_public_key = live_ephemeral_key.public_key().to_bytes();
+	let manifest_hash = manifest_envelope.manifest_hash().to_vec();
+
+	// 3. Finalize PCR state before publishing boot files.
+	attestation::lock_manifest_commitment_pcr_bank(
+		&*state.attestor,
+		&manifest_hash,
+		&setup_ephemeral_public_key,
+		&live_ephemeral_public_key,
+	)?;
+
+	state.set_pending_live_ephemeral_key(live_ephemeral_key);
+	state.handles.put_ephemeral_key(&setup_ephemeral_key)?;
 	state.handles.put_pivot(pivot)?;
 	state.handles.put_manifest_envelope(manifest_envelope)?;
 
-	// 3. Make an attestation request, placing the manifest hash in the
+	// 4. Make an attestation request, placing the manifest hash in the
 	// `user_data` field and the Ephemeral Key public key in the `public_key`
 	// field.
 	let nsm_response = attestation::get_post_boot_attestation_doc(
 		&*state.attestor,
-		ephemeral_key.public_key().to_bytes(),
-		manifest_envelope.manifest.qos_hash().to_vec(),
+		setup_ephemeral_public_key,
+		manifest_hash,
 	);
 
-	// 4. Return the NSM Response containing COSE Sign1 encoded attestation
+	// 5. Return the NSM Response containing COSE Sign1 encoded attestation
 	// document.
 	Ok(nsm_response)
 }
 
 pub(in crate::protocol) fn boot_standard(
 	state: &mut ProtocolState,
-	manifest_envelope: &ManifestEnvelope,
+	manifest_envelope: impl Into<VersionedManifestEnvelope>,
 	pivot: &[u8],
 ) -> Result<NsmResponse, ProtocolError> {
-	let nsm_response = put_manifest_and_pivot(state, manifest_envelope, pivot)?;
+	let manifest_envelope = manifest_envelope.into();
+	let nsm_response =
+		put_manifest_and_pivot(state, &manifest_envelope, pivot)?;
 	Ok(nsm_response)
 }
 
@@ -718,11 +791,46 @@ pub(in crate::protocol) fn boot_standard(
 mod test {
 	use std::path::Path;
 
-	use qos_nsm::mock::MockNsm;
+	use qos_nsm::{
+		NsmProvider,
+		mock::MockNsm,
+		nitro::AttestError,
+		types::{NsmRequest, NsmResponse},
+	};
 	use qos_test_primitives::PathWrapper;
 
 	use super::*;
 	use crate::handles::Handles;
+
+	struct RaceCheckingNsm {
+		inner: MockNsm,
+		handles: Handles,
+	}
+
+	impl RaceCheckingNsm {
+		fn new(handles: Handles) -> Self {
+			Self { inner: MockNsm::new(), handles }
+		}
+	}
+
+	impl NsmProvider for RaceCheckingNsm {
+		fn nsm_process_request(&self, request: NsmRequest) -> NsmResponse {
+			if matches!(
+				request,
+				NsmRequest::ExtendPCR { .. } | NsmRequest::LockPCRs { .. }
+			) {
+				assert!(self.handles.quorum_key_exists());
+				assert!(!self.handles.pivot_exists());
+				assert!(!self.handles.manifest_envelope_exists());
+			}
+
+			self.inner.nsm_process_request(request)
+		}
+
+		fn timestamp_ms(&self) -> Result<u64, AttestError> {
+			self.inner.timestamp_ms()
+		}
+	}
 
 	fn get_manifest() -> (Manifest, Vec<(P256Pair, QuorumMember)>, Vec<u8>) {
 		let quorum_pair = P256Pair::generate().unwrap();
@@ -783,6 +891,21 @@ mod test {
 
 	fn stable_quorum_member(alias: &str, byte: u8) -> QuorumMember {
 		QuorumMember { alias: alias.to_string(), pub_key: vec![byte; 33] }
+	}
+
+	fn mixed_public_key(
+		encryption_pair: &P256Pair,
+		signing_pair: &P256Pair,
+	) -> Vec<u8> {
+		let encryption_key = encryption_pair.public_key().to_bytes();
+		let signing_key = signing_pair.public_key().to_bytes();
+		let component_len = encryption_key.len() / 2;
+
+		encryption_key[..component_len]
+			.iter()
+			.chain(&signing_key[component_len..])
+			.copied()
+			.collect()
 	}
 
 	fn stable_pivot_config_v0() -> PivotConfigV0 {
@@ -971,7 +1094,7 @@ mod test {
 			pivot_file.clone(),
 		);
 		let mut protocol_state =
-			ProtocolState::new(Box::new(MockNsm), handles.clone(), None);
+			ProtocolState::new(Box::new(MockNsm::new()), handles.clone(), None);
 
 		let _nsm_resposne =
 			boot_standard(&mut protocol_state, &manifest_envelope, &pivot)
@@ -980,11 +1103,65 @@ mod test {
 		assert!(Path::new(&pivot_file).exists());
 		assert!(Path::new(&ephemeral_file).exists());
 
-		assert_eq!(handles.get_manifest_envelope().unwrap(), manifest_envelope);
+		assert_eq!(
+			handles.get_manifest_envelope().unwrap(),
+			VersionedManifestEnvelope::V1(manifest_envelope)
+		);
 
 		std::fs::remove_file(pivot_file).unwrap();
 		std::fs::remove_file(ephemeral_file).unwrap();
 		std::fs::remove_file(manifest_file).unwrap();
+	}
+
+	#[test]
+	fn boot_standard_locks_pcrs_before_publishing_pivot_start_files() {
+		let (manifest, members, pivot) = get_manifest();
+
+		let manifest_envelope = {
+			let manifest_hash = manifest.qos_hash();
+			let approvals = members
+				.into_iter()
+				.map(|(pair, member)| Approval {
+					signature: pair.sign(&manifest_hash).unwrap(),
+					member,
+				})
+				.collect();
+
+			ManifestEnvelope {
+				manifest,
+				manifest_set_approvals: approvals,
+				share_set_approvals: vec![],
+			}
+		};
+
+		let pivot_file = PathWrapper::from(
+			"boot_standard_locks_pcrs_before_publishing.pivot",
+		);
+		let ephemeral_file = PathWrapper::from(
+			"boot_standard_locks_pcrs_before_publishing_eph.secret",
+		);
+		let quorum_file = PathWrapper::from(
+			"boot_standard_locks_pcrs_before_publishing_quorum.secret",
+		);
+		let manifest_file = PathWrapper::from(
+			"boot_standard_locks_pcrs_before_publishing.manifest",
+		);
+		let handles = Handles::new(
+			ephemeral_file.display().to_string(),
+			quorum_file.display().to_string(),
+			manifest_file.display().to_string(),
+			pivot_file.display().to_string(),
+		);
+		handles.put_quorum_key(&P256Pair::generate().unwrap()).unwrap();
+
+		let attestor = RaceCheckingNsm::new(handles.clone());
+		let mut protocol_state =
+			ProtocolState::new(Box::new(attestor), handles.clone(), None);
+
+		boot_standard(&mut protocol_state, &manifest_envelope, &pivot).unwrap();
+
+		assert!(handles.pivot_exists());
+		assert!(handles.manifest_envelope_exists());
 	}
 
 	#[test]
@@ -1025,7 +1202,7 @@ mod test {
 			pivot_file,
 		);
 		let mut protocol_state =
-			ProtocolState::new(Box::new(MockNsm), handles.clone(), None);
+			ProtocolState::new(Box::new(MockNsm::new()), handles.clone(), None);
 
 		let nsm_resposne =
 			boot_standard(&mut protocol_state, &manifest_envelope, &pivot);
@@ -1069,7 +1246,7 @@ mod test {
 			pivot_file,
 		);
 		let mut protocol_state =
-			ProtocolState::new(Box::new(MockNsm), handles.clone(), None);
+			ProtocolState::new(Box::new(MockNsm::new()), handles.clone(), None);
 
 		let nsm_resposne =
 			boot_standard(&mut protocol_state, &manifest_envelope, &pivot);
@@ -1102,20 +1279,23 @@ mod test {
 		};
 
 		let pivot_file = PathWrapper::from(
-			"boot_standard_rejects_manifest_envelope_with_share_set_approvals.pivot");
+			"boot_standard_rejects_manifest_envelope_with_share_set_approvals.pivot",
+		);
 		let ephemeral_file = PathWrapper::from(
-			"boot_standard_rejects_manifest_envelope_with_share_set_approvals_eph.secret");
+			"boot_standard_rejects_manifest_envelope_with_share_set_approvals_eph.secret",
+		);
 		let manifest_file = PathWrapper::from(
-			"boot_standard_rejects_manifest_envelope_with_share_set_approvals.manifest");
+			"boot_standard_rejects_manifest_envelope_with_share_set_approvals.manifest",
+		);
 
 		let handles = Handles::new(
-			ephemeral_file.to_str().map(ToString::to_string).unwrap(),
+			ephemeral_file.display().to_string(),
 			"quorum_key".to_string(),
-			manifest_file.to_str().map(ToString::to_string).unwrap(),
-			pivot_file.to_str().map(ToString::to_string).unwrap(),
+			manifest_file.display().to_string(),
+			pivot_file.display().to_string(),
 		);
 		let mut protocol_state =
-			ProtocolState::new(Box::new(MockNsm), handles, None);
+			ProtocolState::new(Box::new(MockNsm::new()), handles, None);
 
 		let error =
 			boot_standard(&mut protocol_state, &manifest_envelope, &pivot)
@@ -1160,18 +1340,20 @@ mod test {
 			"boot_standard_rejects_approval_from_non_manifest_set_member.pivot",
 		);
 		let ephemeral_file = PathWrapper::from(
-			"boot_standard_rejects_approval_from_non_manifest_set_member.secret");
+			"boot_standard_rejects_approval_from_non_manifest_set_member.secret",
+		);
 		let manifest_file = PathWrapper::from(
-			"boot_standard_rejects_approval_from_non_manifest_set_member.manifest");
+			"boot_standard_rejects_approval_from_non_manifest_set_member.manifest",
+		);
 
 		let handles = Handles::new(
-			ephemeral_file.to_str().map(ToString::to_string).unwrap(),
+			ephemeral_file.display().to_string(),
 			"quorum_key".to_string(),
-			manifest_file.to_str().map(ToString::to_string).unwrap(),
-			pivot_file.to_str().map(ToString::to_string).unwrap(),
+			manifest_file.display().to_string(),
+			pivot_file.display().to_string(),
 		);
 		let mut protocol_state =
-			ProtocolState::new(Box::new(MockNsm), handles, None);
+			ProtocolState::new(Box::new(MockNsm::new()), handles, None);
 
 		let error =
 			boot_standard(&mut protocol_state, &manifest_envelope, &pivot)
@@ -1213,6 +1395,95 @@ mod test {
 
 		let err = manifest_envelope.check_approvals().unwrap_err();
 		assert_eq!(err, ProtocolError::DuplicateApproval);
+	}
+
+	fn assert_duplicate_members_rejected(members: &[QuorumMember]) {
+		assert_eq!(
+			ensure_unique_members(members).unwrap_err(),
+			ProtocolError::DuplicateQuorumMember
+		);
+	}
+
+	#[test]
+	fn rejects_duplicate_member_alias() {
+		let pair_a = P256Pair::generate().unwrap();
+		let pair_b = P256Pair::generate().unwrap();
+		let member = |alias: &str, pub_key: Vec<u8>| QuorumMember {
+			alias: alias.to_string(),
+			pub_key,
+		};
+		assert_duplicate_members_rejected(&[
+			member("a", pair_a.public_key().to_bytes()),
+			member("a", pair_b.public_key().to_bytes()),
+		]);
+	}
+
+	#[test]
+	fn rejects_duplicate_signing_key() {
+		let pair_a = P256Pair::generate().unwrap();
+		let pair_b = P256Pair::generate().unwrap();
+		let pair_c = P256Pair::generate().unwrap();
+		assert_duplicate_members_rejected(&[
+			QuorumMember {
+				alias: "a".to_string(),
+				pub_key: mixed_public_key(&pair_b, &pair_a),
+			},
+			QuorumMember {
+				alias: "b".to_string(),
+				pub_key: mixed_public_key(&pair_c, &pair_a),
+			},
+		]);
+	}
+
+	#[test]
+	fn rejects_duplicate_encryption_key() {
+		let pair_a = P256Pair::generate().unwrap();
+		let pair_b = P256Pair::generate().unwrap();
+		let pair_c = P256Pair::generate().unwrap();
+		assert_duplicate_members_rejected(&[
+			QuorumMember {
+				alias: "a".to_string(),
+				pub_key: mixed_public_key(&pair_a, &pair_b),
+			},
+			QuorumMember {
+				alias: "b".to_string(),
+				pub_key: mixed_public_key(&pair_a, &pair_c),
+			},
+		]);
+	}
+
+	#[test]
+	fn check_approvals_rejects_same_key_under_different_aliases() {
+		let (mut manifest, members, ..) = get_manifest();
+
+		let (pair, member) = &members[0];
+		let alias_a = QuorumMember {
+			alias: "alias-a".to_string(),
+			pub_key: member.pub_key.clone(),
+		};
+		let alias_b = QuorumMember {
+			alias: "alias-b".to_string(),
+			pub_key: member.pub_key.clone(),
+		};
+		manifest.manifest_set = ManifestSet {
+			threshold: 2,
+			members: vec![alias_a.clone(), alias_b.clone()],
+		};
+
+		let manifest_hash = manifest.qos_hash();
+		let signature = pair.sign(&manifest_hash).unwrap();
+
+		let manifest_envelope = ManifestEnvelope {
+			manifest,
+			manifest_set_approvals: vec![
+				Approval { signature: signature.clone(), member: alias_a },
+				Approval { signature, member: alias_b },
+			],
+			share_set_approvals: vec![],
+		};
+
+		let err = manifest_envelope.check_approvals().unwrap_err();
+		assert_eq!(err, ProtocolError::DuplicateQuorumMember);
 	}
 
 	#[test]

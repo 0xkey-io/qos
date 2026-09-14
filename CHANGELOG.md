@@ -7,6 +7,441 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## `qos_client` - [0.14.1](https://github.com/tkhq/qos/compare/qos_client-v0.14.0...qos_client-v0.14.1) - 2026-08-26
+
+### Added
+- *(qos_client)* re-export the yubikey crate as yubikey_crate
+
+## `qos_client` - [0.14.0](https://github.com/tkhq/qos/compare/qos_client-v0.13.0...qos_client-v0.14.0) - 2026-08-14
+
+### Other
+- Merge pull request #777 from tkhq/zeke/pcr3-verification
+- anchor PCR3 verification to the manifest
+- don't allow legacy genesis messages
+- Commit GenesisOutput to the exact boot genesis request and verify it in qos_client
+
+## `qos_net` - [0.14.0](https://github.com/tkhq/qos/compare/qos_net-v0.13.0...qos_net-v0.14.0) - 2026-08-14
+
+### Fixed
+- fix tests
+
+## `qos_core` - [0.14.0](https://github.com/tkhq/qos/compare/qos_core-v0.13.0...qos_core-v0.14.0) - 2026-08-14
+
+### Added
+- *(qos_client)* review schema version, debug mode, bridges, and DNS when approving a manifest
+- *(test-harness)* add Docker QEMU integration harness
+
+### Fixed
+- *(qos_core)* reject manifests whose declared version contradicts their schema
+- *(qos_core)* reject quorum member sets with duplicate aliases, signing keys, or encryption keys
+- *(qos-core)* replace existing egress default route
+
+### Other
+- Improve manifest compatibility handling
+- don't allow legacy genesis messages
+- Commit GenesisOutput to the exact boot genesis request and verify it in qos_client
+- *(qemu)* use the production enclave EIF in end-to-end tests
+
+## `qos_p256` - [0.14.0](https://github.com/tkhq/qos/compare/qos_p256-v0.13.0...qos_p256-v0.14.0) - 2026-08-14
+
+### Fixed
+- *(qos_core)* reject quorum member sets with duplicate aliases, signing keys, or encryption keys
+
+### Other
+- Set owner-only mode on secret file outputs
+
+## `qos_nsm` - [0.14.0](https://github.com/tkhq/qos/compare/qos_nsm-v0.13.0...qos_nsm-v0.14.0) - 2026-08-14
+
+### Other
+- attestation doc + manifest verification spec
+
+## `qos_client` - [0.13.0](https://github.com/tkhq/qos/compare/qos_client-v0.12.2...qos_client-v0.13.0) - 2026-07-20
+
+### Added
+- [**breaking**] A small qos manifest builder api
+
+## `qos_net` - [0.13.0](https://github.com/tkhq/qos/compare/qos_net-v0.12.2...qos_net-v0.13.0) - 2026-07-20
+
+### Fixed
+- *(qos_net)* pin LookupIpStrategy to Ipv4thenIpv6
+
+## `qos_core` - [0.13.0](https://github.com/tkhq/qos/compare/qos_core-v0.12.2...qos_core-v0.13.0) - 2026-07-20
+
+### Added
+- [**breaking**] A small qos manifest builder api
+
+### Other
+- Address Review
+
+## `qos_net` - [0.12.2](https://github.com/tkhq/qos/compare/qos_net-v0.12.1...qos_net-v0.12.2) - 2026-07-13
+
+### Other
+- reuse DNS resolver instances
+- remove duplicate README file
+
+## `qos_core` - [0.12.2](https://github.com/tkhq/qos/compare/qos_core-v0.12.1...qos_core-v0.12.2) - 2026-07-13
+
+### Other
+- Merge origin/main into zeke/mock-nsm-attestation
+- sign mock attestation docs; qos_core: fully verify key export
+
+## `qos_nsm` - [0.12.2](https://github.com/tkhq/qos/compare/qos_nsm-v0.12.1...qos_nsm-v0.12.2) - 2026-07-13
+
+### Other
+- Merge origin/main into zeke/mock-nsm-attestation
+- sign mock attestation docs; qos_core: fully verify key export
+
+## `qos_client` - [0.12.1](https://github.com/tkhq/qos/compare/qos_client-v0.12.0...qos_client-v0.12.1) - 2026-07-09
+
+### Fixed
+- *(qos_client)* gate advanced_provision_yubikey re-export behind smartcard
+
+### Other
+- Merge pull request #756 from tkhq/swag/crate-readme-docs
+
+## `qos_test_primitives` - [0.12.1](https://github.com/tkhq/qos/compare/qos_test_primitives-v0.12.0...qos_test_primitives-v0.12.1) - 2026-07-09
+
+### Other
+- satisfy readme lint
+- rely on crate readmes for root docs
+- add readmes for published crates
+
+## `qos_net` - [0.12.1](https://github.com/tkhq/qos/compare/qos_net-v0.12.0...qos_net-v0.12.1) - 2026-07-09
+
+### Other
+- Merge pull request #756 from tkhq/swag/crate-readme-docs
+- *(qos_net)* cargo fmt
+- *(qos_net)* use new hickory resolver api
+
+## `qos_core` - [0.12.1](https://github.com/tkhq/qos/compare/qos_core-v0.12.0...qos_core-v0.12.1) - 2026-07-09
+
+### Other
+- satisfy readme lint
+- address crate readme feedback
+- rely on crate readmes for root docs
+- add readmes for published crates
+
+## `qos_p256` - [0.12.1](https://github.com/tkhq/qos/compare/qos_p256-v0.12.0...qos_p256-v0.12.1) - 2026-07-09
+
+### Other
+- satisfy readme lint
+- add readmes for published crates
+
+## `qos_nsm` - [0.12.1](https://github.com/tkhq/qos/compare/qos_nsm-v0.12.0...qos_nsm-v0.12.1) - 2026-07-09
+
+### Other
+- satisfy readme lint
+- rely on crate readmes for root docs
+- add readmes for published crates
+
+## `qos_json` - [0.12.1](https://github.com/tkhq/qos/compare/qos_json-v0.12.0...qos_json-v0.12.1) - 2026-07-09
+
+### Other
+- satisfy readme lint
+- add readmes for published crates
+
+## `qos_hex` - [0.12.1](https://github.com/tkhq/qos/compare/qos_hex-v0.12.0...qos_hex-v0.12.1) - 2026-07-09
+
+### Fixed
+- *(qos_hex)* enable serde/alloc from the serde feature
+
+### Other
+- Merge pull request #756 from tkhq/swag/crate-readme-docs
+- remove qos_hex comment
+
+## `qos_crypto` - [0.12.1](https://github.com/tkhq/qos/compare/qos_crypto-v0.12.0...qos_crypto-v0.12.1) - 2026-07-09
+
+### Other
+- satisfy readme lint
+- rely on crate readmes for root docs
+- add readmes for published crates
+
+## `qos_client` - [0.12.0](https://github.com/tkhq/qos/compare/qos_client-v0.11.0...qos_client-v0.12.0) - 2026-07-01
+
+### Added
+- add dns config to manifest v2
+
+## `qos_core` - [0.12.0](https://github.com/tkhq/qos/compare/qos_core-v0.11.0...qos_core-v0.12.0) - 2026-07-01
+
+### Added
+- add dns config to manifest v2
+
+## `qos_client` - [0.11.0](https://github.com/tkhq/qos/compare/qos_client-v0.10.2...qos_client-v0.11.0) - 2026-06-29
+
+### Added
+- [**breaking**] add new pcrs
+
+## `qos_core` - [0.11.0](https://github.com/tkhq/qos/compare/qos_core-v0.10.2...qos_core-v0.11.0) - 2026-06-29
+
+### Added
+- [**breaking**] add new pcrs
+
+### Other
+- mark error enums non exhaustive
+- set egress tunnel MTU size to 1320
+- ensure qemu workarounds also work on ingress
+
+## `qos_nsm` - [0.11.0](https://github.com/tkhq/qos/compare/qos_nsm-v0.10.2...qos_nsm-v0.11.0) - 2026-06-29
+
+### Added
+- [**breaking**] add new pcrs
+
+### Other
+- mark error enums non exhaustive
+
+## `qos_client` - [0.10.2](https://github.com/tkhq/qos/compare/qos_client-v0.10.1...qos_client-v0.10.2) - 2026-06-15
+
+### Fixed
+- Added a general Borsh fallback for JSON protocol deserialization errors so legacy-format service responses continue to work across all CLI service calls. ([#733](https://github.com/tkhq/qos/pull/733))
+
+## `qos_core` - [0.10.2](https://github.com/tkhq/qos/compare/qos_core-v0.10.1...qos_core-v0.10.2) - 2026-06-15
+
+### Other
+- No user-facing changes; released as part of the coordinated `0.10.2` workspace version.
+
+## `qos_crypto` - [0.10.2](https://github.com/tkhq/qos/compare/qos_crypto-v0.10.1...qos_crypto-v0.10.2) - 2026-06-15
+
+### Other
+- No user-facing changes; released as part of the coordinated `0.10.2` workspace version.
+
+## `qos_hex` - [0.10.2](https://github.com/tkhq/qos/compare/qos_hex-v0.10.1...qos_hex-v0.10.2) - 2026-06-15
+
+### Other
+- No user-facing changes; released as part of the coordinated `0.10.2` workspace version.
+
+## `qos_net` - [0.10.2](https://github.com/tkhq/qos/compare/qos_net-v0.10.1...qos_net-v0.10.2) - 2026-06-15
+
+### Other
+- No user-facing changes; released as part of the coordinated `0.10.2` workspace version.
+
+## `qos_p256` - [0.10.2](https://github.com/tkhq/qos/compare/qos_p256-v0.10.1...qos_p256-v0.10.2) - 2026-06-15
+
+### Other
+- No user-facing changes; released as part of the coordinated `0.10.2` workspace version.
+
+## `qos_nsm` - [0.10.2](https://github.com/tkhq/qos/compare/qos_nsm-v0.10.1...qos_nsm-v0.10.2) - 2026-06-15
+
+### Other
+- No user-facing changes; released as part of the coordinated `0.10.2` workspace version.
+
+## `qos_test_primitives` - [0.10.2](https://github.com/tkhq/qos/compare/qos_test_primitives-v0.10.1...qos_test_primitives-v0.10.2) - 2026-06-15
+
+### Other
+- No user-facing changes; released as part of the coordinated `0.10.2` workspace version.
+
+## `qos_json` - [0.10.2](https://github.com/tkhq/qos/compare/qos_json-v0.10.1...qos_json-v0.10.2) - 2026-06-15
+
+### Other
+- No user-facing changes; released as part of the coordinated `0.10.2` workspace version.
+
+## Repository - 2026-06-15
+
+### Added
+- Added a `signed_echo` test application, container image, and image-publishing workflow for egress testing. ([#720](https://github.com/tkhq/qos/pull/720))
+- Added DNS resolver configuration to the QEMU and `qos_enclave_egress` images so egress-enabled enclaves can resolve hostnames. ([#730](https://github.com/tkhq/qos/pull/730))
+
+### Documentation
+- Documented enclave ephemeral keys, quorum keys, and their roles in QOS boot and verification flows. ([#731](https://github.com/tkhq/qos/pull/731))
+
+## `qos_crypto` - [0.10.1](https://github.com/tkhq/qos/compare/qos_crypto-v0.10.0...qos_crypto-v0.10.1) - 2026-06-09
+
+### Other
+- No user-facing changes; released as part of the coordinated `0.10.1` workspace version.
+
+## `qos_hex` - [0.10.1](https://github.com/tkhq/qos/compare/qos_hex-v0.10.0...qos_hex-v0.10.1) - 2026-06-09
+
+### Other
+- No user-facing changes; released as part of the coordinated `0.10.1` workspace version.
+
+## `qos_json` - [0.10.1](https://github.com/tkhq/qos/compare/qos_json-v0.10.0...qos_json-v0.10.1) - 2026-06-09
+
+### Other
+- No user-facing changes; released as part of the coordinated `0.10.1` workspace version.
+
+## `qos_nsm` - [0.10.1](https://github.com/tkhq/qos/compare/qos_nsm-v0.10.0...qos_nsm-v0.10.1) - 2026-06-09
+
+### Other
+- No user-facing changes; released as part of the coordinated `0.10.1` workspace version.
+
+## `qos_p256` - [0.10.1](https://github.com/tkhq/qos/compare/qos_p256-v0.10.0...qos_p256-v0.10.1) - 2026-06-09
+
+### Other
+- No user-facing changes; released as part of the coordinated `0.10.1` workspace version.
+
+## `qos_client` - [0.10.1](https://github.com/tkhq/qos/compare/qos_client-v0.10.0...qos_client-v0.10.1) - 2026-06-09
+
+### Fixed
+- Report invalid CLI input errors back to the caller. ([#715](https://github.com/tkhq/qos/pull/715))
+
+## `qos_core` - [0.10.1](https://github.com/tkhq/qos/compare/qos_core-v0.10.0...qos_core-v0.10.1) - 2026-06-09
+
+### Added
+- Added transparent egress support for enclave networking. ([#715](https://github.com/tkhq/qos/pull/715))
+
+## `qos_net` - [0.10.1](https://github.com/tkhq/qos/compare/qos_net-v0.10.0...qos_net-v0.10.1) - 2026-06-09
+
+### Other
+- No user-facing changes; released as part of the coordinated `0.10.1` workspace version.
+
+## `qos_test_primitives` - [0.10.1](https://github.com/tkhq/qos/compare/qos_test_primitives-v0.10.0...qos_test_primitives-v0.10.1) - 2026-06-09
+
+### Other
+- No user-facing changes; released as part of the coordinated `0.10.1` workspace version.
+
+## `qos_net` - [0.10.0](https://github.com/tkhq/qos/compare/qos_net-v0.9.0...qos_net-v0.10.0) - 2026-06-01
+
+### Changed
+- [**breaking**] Removed the `vm` Cargo feature flag and now select macOS-compatible local socket behavior from `target_os = "macos"` at compile time. ([#714](https://github.com/tkhq/qos/pull/714))
+
+## `qos_core` - [0.10.0](https://github.com/tkhq/qos/compare/qos_core-v0.9.0...qos_core-v0.10.0) - 2026-06-01
+
+### Changed
+- [**breaking**] Removed the `vm` Cargo feature flag and now select vsock-vs-Unix-socket behavior from the compile target: macOS builds use Unix sockets and non-macOS builds use vsock. ([#714](https://github.com/tkhq/qos/pull/714))
+
+## `qos_client` - [0.9.0](https://github.com/tkhq/qos/compare/qos_client-v0.8.0...qos_client-v0.9.0) - 2026-05-28
+
+### Fixed
+- Restored compatibility for key-forwarding and key-export flows that use v0/v1 manifest envelopes by trying the legacy Borsh protocol encoding first, then falling back to JSON. v2 manifest envelopes remain JSON-only. ([#718](https://github.com/tkhq/qos/pull/718))
+
+### Security
+- Zeroized YubiKey PINs, Shamir split/reconstruct inputs, and decrypted plaintext handled by the CLI to reduce the lifetime of sensitive material in memory. ([#711](https://github.com/tkhq/qos/pull/711))
+
+## `qos_core` - [0.9.0](https://github.com/tkhq/qos/compare/qos_core-v0.8.0...qos_core-v0.9.0) - 2026-05-28
+
+### Fixed
+- Preserved the legacy Borsh discriminant for `ProtocolError::ProtocolMsgDeserialization` by moving the newer `InvalidPivotEnv` variant to the end of the enum. ([#718](https://github.com/tkhq/qos/pull/718))
+
+### Security
+- Zeroized quorum key material, decrypted key shares, and reconstructed Shamir secrets during genesis, provisioning, and key-injection flows. ([#711](https://github.com/tkhq/qos/pull/711))
+
+## `qos_p256` - [0.9.0](https://github.com/tkhq/qos/compare/qos_p256-v0.8.0...qos_p256-v0.9.0) - 2026-05-28
+
+### Changed
+- Updated P256 secret-handling APIs to accept or return `Zeroizing` wrappers for master seeds, derived signing/encryption secrets, and decrypted plaintext. ([#711](https://github.com/tkhq/qos/pull/711))
+
+## `qos_crypto` - [0.9.0](https://github.com/tkhq/qos/compare/qos_crypto-v0.8.0...qos_crypto-v0.9.0) - 2026-05-28
+
+### Changed
+- Updated Shamir secret-sharing helpers so generated shares and reconstructed secrets are wrapped in `Zeroizing`, while retaining compatibility with existing share data. ([#711](https://github.com/tkhq/qos/pull/711))
+
+## `qos_hex` - [0.9.0](https://github.com/tkhq/qos/compare/qos_hex-v0.8.0...qos_hex-v0.9.0) - 2026-05-28
+
+### Other
+- No user-facing changes; released as part of the coordinated `0.9.0` workspace version.
+
+## `qos_net` - [0.9.0](https://github.com/tkhq/qos/compare/qos_net-v0.8.0...qos_net-v0.9.0) - 2026-05-28
+
+### Other
+- No user-facing changes; released as part of the coordinated `0.9.0` workspace version.
+
+## `qos_nsm` - [0.9.0](https://github.com/tkhq/qos/compare/qos_nsm-v0.8.0...qos_nsm-v0.9.0) - 2026-05-28
+
+### Other
+- No user-facing changes; released as part of the coordinated `0.9.0` workspace version.
+
+## `qos_test_primitives` - [0.9.0](https://github.com/tkhq/qos/compare/qos_test_primitives-v0.8.0...qos_test_primitives-v0.9.0) - 2026-05-28
+
+### Other
+- No user-facing changes; released as part of the coordinated `0.9.0` workspace version.
+
+## `qos_json` - [0.9.0](https://github.com/tkhq/qos/compare/qos_json-v0.8.0...qos_json-v0.9.0) - 2026-05-28
+
+### Other
+- No user-facing changes; released as part of the coordinated `0.9.0` workspace version.
+
+## `qos_client` - [0.8.0](https://github.com/tkhq/qos/compare/qos_client-v0.7.0...qos_client-v0.8.0) - 2026-05-17
+
+### Added
+- Added support for both JSON and Borsh wire formats, QOS JSON manifest v2 signing payloads, and legacy manifest decoding while preserving v0/v1 manifest compatibility ([#697](https://github.com/tkhq/qos/pull/697))
+- Added `enclave-version` to query a running enclave for its QOS version and build commit ([#689](https://github.com/tkhq/qos/pull/689))
+- Added pivot environment variable support ([#674](https://github.com/tkhq/qos/pull/674), [#685](https://github.com/tkhq/qos/pull/685))
+
+### Changed
+- Moved the Cargo workspace manifest from `src/Cargo.toml` to the repository root ([#686](https://github.com/tkhq/qos/pull/686))
+- Upgraded the crate to Rust 2024 edition and the workspace Rust toolchain to 1.94 ([#696](https://github.com/tkhq/qos/pull/696), [#700](https://github.com/tkhq/qos/pull/700))
+- Enforced `clippy::pedantic` and filled in missing public API docs required by the stricter lint set ([#676](https://github.com/tkhq/qos/pull/676))
+
+### Other
+- Added and normalized user-facing docs for networking, boot standard, key forwarding, YubiKey provisioning, and related README content ([#675](https://github.com/tkhq/qos/pull/675), [#678](https://github.com/tkhq/qos/pull/678), [#679](https://github.com/tkhq/qos/pull/679), [#681](https://github.com/tkhq/qos/pull/681), [#692](https://github.com/tkhq/qos/pull/692))
+
+## `qos_test_primitives` - [0.8.0](https://github.com/tkhq/qos/compare/qos_test_primitives-v0.7.0...qos_test_primitives-v0.8.0) - 2026-05-17
+
+### Added
+- Made `PathWrapper` generic over `AsRef<Path>`, made `ChildWrapper` deref/future-friendly, and generalized socket wait helpers ([#689](https://github.com/tkhq/qos/pull/689))
+
+### Fixed
+- Fixed port selection by binding to available ports and checking TCP readiness by connecting instead of attempting to bind again ([#673](https://github.com/tkhq/qos/pull/673))
+
+### Other
+- Upgraded to Rust 2024 edition ([#700](https://github.com/tkhq/qos/pull/700))
+
+## `qos_net` - [0.8.0](https://github.com/tkhq/qos/compare/qos_net-v0.7.0...qos_net-v0.8.0) - 2026-05-17
+
+### Changed
+- Enforced `clippy::pedantic`, cleaned up proxy documentation/lints, and removed unnecessary async from bridge helpers that only spawn work ([#676](https://github.com/tkhq/qos/pull/676))
+- Upgraded to Rust 2024 edition ([#700](https://github.com/tkhq/qos/pull/700))
+
+### Other
+- Cleaned up fuzz-target lints and removed Docker requirements from CI ([#670](https://github.com/tkhq/qos/pull/670), [#688](https://github.com/tkhq/qos/pull/688))
+
+## `qos_core` - [0.8.0](https://github.com/tkhq/qos/compare/qos_core-v0.7.0...qos_core-v0.8.0) - 2026-05-17
+
+### Added
+- Added support for both JSON and Borsh wire formats, including QOS JSON manifest v2, JSON protocol envelope handling, `BootStandardJsonEnvelopeRequest`, and compatibility-preserving parsing for existing v0/v1 manifests ([#697](https://github.com/tkhq/qos/pull/697))
+- Added `VersionRequest` and `VersionResponse { version, commit }` protocol messages, registered across all phases, plus build-time commit capture via `QOS_GIT_COMMIT` or `git rev-parse` fallback ([#689](https://github.com/tkhq/qos/pull/689))
+- Added pivot environment variable support ([#674](https://github.com/tkhq/qos/pull/674))
+
+### Fixed
+- Preserved manifest signing-payload compatibility for pivot environment variables after the initial breaking manifest change ([#685](https://github.com/tkhq/qos/pull/685))
+- Moved synchronous protocol handling behind `tokio::task::block_in_place` ([#671](https://github.com/tkhq/qos/pull/671))
+- Avoided undrained pivot stdout/stderr pipes by using `Stdio::null()` unless pivot debug mode is enabled ([#693](https://github.com/tkhq/qos/pull/693))
+
+### Changed
+- Moved the Cargo workspace manifest to the repository root and updated workspace paths ([#686](https://github.com/tkhq/qos/pull/686))
+- Upgraded to Rust 2024 edition and Rust 1.94, including match-ergonomics and lint cleanups required by the newer toolchain ([#696](https://github.com/tkhq/qos/pull/696), [#700](https://github.com/tkhq/qos/pull/700))
+- Enforced `clippy::pedantic`, removed unnecessary async from spawn-only helpers, and improved attestation validation ([#676](https://github.com/tkhq/qos/pull/676))
+
+## `qos_p256` - [0.8.0](https://github.com/tkhq/qos/compare/qos_p256-v0.7.0...qos_p256-v0.8.0) - 2026-05-17
+
+### Added
+- Added `serde` support for `P256Error` so P256 errors can participate in JSON protocol and manifest payloads ([#697](https://github.com/tkhq/qos/pull/697))
+
+### Changed
+- Enforced `clippy::pedantic`, cleaned up fuzz-target lints, and added the missing public API error/panic documentation required by the stricter lint set ([#670](https://github.com/tkhq/qos/pull/670), [#676](https://github.com/tkhq/qos/pull/676))
+- Upgraded to Rust 2024 edition ([#700](https://github.com/tkhq/qos/pull/700))
+
+## `qos_nsm` - [0.8.0](https://github.com/tkhq/qos/compare/qos_nsm-v0.7.0...qos_nsm-v0.8.0) - 2026-05-17
+
+### Added
+- Added `serde` support for NSM request/response/error types so they can be represented in JSON protocol payloads ([#697](https://github.com/tkhq/qos/pull/697))
+
+### Changed
+- Enforced `clippy::pedantic` and improved Nitro attestation syntactic validation ([#676](https://github.com/tkhq/qos/pull/676))
+- Upgraded to Rust 2024 edition ([#700](https://github.com/tkhq/qos/pull/700))
+
+## `qos_json` - [0.8.0](https://github.com/tkhq/qos/compare/qos_json-v0.7.0...qos_json-v0.8.0) - 2026-05-17
+
+### Added
+- Added the `qos_json` crate with a canonical JSON format and spec for signing payloads, including stricter encoding rules than generic JSON canonicalization ([#697](https://github.com/tkhq/qos/pull/697))
+
+## `qos_hex` - [0.8.0](https://github.com/tkhq/qos/compare/qos_hex-v0.7.0...qos_hex-v0.8.0) - 2026-05-17
+
+### Added
+- Added serde helpers for optional hex-encoded byte values used by JSON protocol and manifest payloads ([#697](https://github.com/tkhq/qos/pull/697))
+
+### Changed
+- Enforced `clippy::pedantic`, added missing error/panic docs, removed the largest fixed-size `FromHex` array impl, and made ASCII validation take bytes by value ([#676](https://github.com/tkhq/qos/pull/676))
+- Upgraded to Rust 2024 edition ([#700](https://github.com/tkhq/qos/pull/700))
+
+## `qos_crypto` - [0.8.0](https://github.com/tkhq/qos/compare/qos_crypto-v0.7.0...qos_crypto-v0.8.0) - 2026-05-17
+
+### Changed
+- Enforced `clippy::pedantic`, cleaned up fuzz-target lints, and added missing error documentation for public crypto APIs ([#670](https://github.com/tkhq/qos/pull/670), [#676](https://github.com/tkhq/qos/pull/676))
+- Upgraded to Rust 2024 edition ([#700](https://github.com/tkhq/qos/pull/700))
+
+### Security
+- Bumped dependencies with known security or soundness issues, including `rand`, `rustls-webpki`, and `openssl` transitive lockfile updates ([#690](https://github.com/tkhq/qos/pull/690))
+
 ## `qos_core` - [0.7.0](https://github.com/tkhq/qos/compare/qos_core-v0.6.1...qos_core-v0.7.0) - 2026-04-16
 
 ### Changed

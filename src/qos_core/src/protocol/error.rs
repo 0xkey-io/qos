@@ -5,11 +5,21 @@ use qos_p256::P256Error;
 use crate::{
 	client::ClientError,
 	io::IOError,
-	protocol::{services::boot, ProtocolPhase},
+	protocol::{ProtocolPhase, services::boot},
 };
 
 /// A error from protocol execution.
-#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[derive(
+	Debug,
+	Clone,
+	PartialEq,
+	Eq,
+	BorshSerialize,
+	BorshDeserialize,
+	serde::Serialize,
+	serde::Deserialize,
+)]
+#[non_exhaustive]
 pub enum ProtocolError {
 	/// A encrypted quorum key share sent to the enclave was invalid.
 	InvalidShare,
@@ -35,8 +45,6 @@ pub enum ProtocolError {
 		/// Actual hash as hex string.
 		actual: String,
 	},
-	/// Pivot environment variables are invalid.
-	InvalidPivotEnv(String),
 	/// The message is too large.
 	OversizeMsg,
 	/// Message could not be deserialized
@@ -141,8 +149,10 @@ pub enum ProtocolError {
 	/// The manifest has a lower nonce then the current manifest.
 	LowNonce {
 		/// Expected minimum nonce value.
+		#[serde(with = "qos_json::string_or_numeric")]
 		expected: u32,
 		/// Actual nonce value.
+		#[serde(with = "qos_json::string_or_numeric")]
 		actual: u32,
 	},
 	/// The manifests have different PCR3 values.
@@ -180,6 +190,16 @@ pub enum ProtocolError {
 	QosCrypto(String),
 	/// Error during expanding the `StreamPool`.
 	PoolExpandError,
+	/// Pivot environment variables are invalid.
+	InvalidPivotEnv(String),
+	/// The precommitted live ephemeral key is missing from protocol state.
+	MissingLiveEphemeralKey,
+	/// A set of quorum members contains the same alias, signing public key,
+	/// or encryption public key more than once.
+	DuplicateQuorumMember,
+	/// Genesis messages are only supported on the canonical JSON wire
+	/// encoding; legacy Borsh genesis is not supported.
+	LegacyGenesisNotSupported,
 }
 
 impl From<std::io::Error> for ProtocolError {
@@ -344,12 +364,18 @@ impl std::fmt::Display for ProtocolError {
 				)
 			}
 			Self::LowNonce { expected, actual } => {
-				write!(f, "manifest nonce too low: expected >= {expected}, got {actual}")
+				write!(
+					f,
+					"manifest nonce too low: expected >= {expected}, got {actual}"
+				)
 			}
 			Self::DifferentPcr3 { expected, actual } => {
 				write!(f, "different PCR3: expected {expected}, got {actual}")
 			}
 			Self::MissingEphemeralKey => write!(f, "missing ephemeral key"),
+			Self::MissingLiveEphemeralKey => {
+				write!(f, "missing precommitted live ephemeral key")
+			}
 			Self::InvalidEphemeralKey => write!(f, "invalid ephemeral key"),
 			Self::InvalidEncryptedQuorumKeySignature => {
 				write!(f, "invalid encrypted quorum key signature")
@@ -371,6 +397,18 @@ impl std::fmt::Display for ProtocolError {
 			}
 			Self::QosCrypto(e) => write!(f, "crypto error: {e}"),
 			Self::PoolExpandError => write!(f, "pool expand error"),
+			Self::DuplicateQuorumMember => {
+				write!(
+					f,
+					"duplicate quorum member alias or public key component"
+				)
+			}
+			Self::LegacyGenesisNotSupported => {
+				write!(
+					f,
+					"genesis messages are only supported on the JSON wire encoding"
+				)
+			}
 		}
 	}
 }

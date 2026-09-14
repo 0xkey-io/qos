@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 description = "Multipurpose CLI client for interacting with QuorumOS enclaves and related operations"
 repository = "https://github.com/tkhq/qos"
+readme = "README.md"
 keywords = ["quorumos", "enclave", "nitro", "attestation", "client"]
 categories = ["command-line-utilities"]
 
@@ -18,6 +19,7 @@ qos_crypto = { workspace = true, default-features = false }
 qos_hex = { workspace = true }
 qos_p256 = { workspace = true }
 qos_nsm = { workspace = true, default-features = false }
+qos_json = { workspace = true }
 
 # Third party
 ureq = { workspace = true }
@@ -25,7 +27,7 @@ aws-nitro-enclaves-nsm-api = { workspace = true }
 borsh = { workspace = true}
 p256 = { workspace = true }
 rand_core = { workspace = true, features = ["os_rng"] }
-zeroize = { workspace = true }
+zeroize = { workspace = true, features = ["alloc"] }
 rpassword = { workspace = true }
 serde_json = { workspace = true }
 

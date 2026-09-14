@@ -8,7 +8,7 @@
 //! cargo run --bin qos_client <command-name> --help
 //! ```
 
-use std::{collections::HashSet, env};
+use std::{collections::HashSet, env, net::IpAddr};
 
 use qos_core::{
 	parser::{CommandParser, GetParserForCommand, Parser, Token},
@@ -21,7 +21,9 @@ use qos_core::{
 mod services;
 
 pub use services::PairOrYubi;
-pub use services::{advanced_provision_yubikey, generate_file_key};
+#[cfg(feature = "smartcard")]
+pub use services::advanced_provision_yubikey;
+pub use services::generate_file_key;
 
 const HOST_IP: &str = "host-ip";
 const HOST_PORT: &str = "host-port";
@@ -45,6 +47,7 @@ const UNSAFE_AUTO_CONFIRM: &str = "unsafe-auto-confirm";
 const PUB_PATH: &str = "pub-path";
 const DEBUG_MODE: &str = "debug-mode";
 const BRIDGE_CONFIG: &str = "bridge-config";
+const DNS_RESOLVERS: &str = "dns-resolvers";
 const YUBIKEY: &str = "yubikey";
 const SECRET_PATH: &str = "secret-path";
 const SHARE_PATH: &str = "share-path";
@@ -76,6 +79,7 @@ const PLAINTEXT_PATH: &str = "plaintext-path";
 const OUTPUT_HEX: &str = "output-hex";
 const VALIDATION_TIME_OVERRIDE: &str = "validation-time-override";
 const JSON: &str = "json";
+const USE_MANIFEST_VERSION: &str = "use-manifest-version";
 
 pub(crate) enum DisplayType {
 	Manifest,
@@ -278,12 +282,6 @@ impl From<String> for Command {
 }
 
 impl Command {
-	fn print_all() {
-		println!(
-			"\thost-health, enclave-status, generate-file-key, generate-manifest-envelope, boot-genesis,\n\tafter-genesis, verify-genesis, generate-manifest, approve-manifest, boot-standard, get-attestation-doc,\n\tget-ephemeral-key-hex, proxy-re-encrypt-share, post-share, dangerous-dev-boot,\n\tprovision-yubikey, advanced-provision-yubikey, pivot-hash, shamir-split, shamir-reconstruct,\n\tyubikey-sign, yubikey-public, yubikey-piv-reset, yubikey-change-pin, display, json-to-borsh,\n\tboot-key-fwd, export-key, inject-key, p256-verify, p256-sign, p256-asymmetric-encrypt, p256-asymmetric-decrypt"
-		);
-	}
-
 	fn namespace_token() -> Token {
 		Token::new(NAMESPACE, "Namespace for the associated manifest.")
 			.takes_value(true)
@@ -361,13 +359,19 @@ impl Command {
 		.takes_value(true)
 		.required(true)
 	}
-	fn patch_set_dir_token() -> Token {
+	fn patch_set_dir_optional_token() -> Token {
 		Token::new(
 			PATCH_SET_DIR,
 			"Director with public keys for members of the patch set.",
 		)
 		.takes_value(true)
-		.required(true)
+	}
+	fn use_manifest_version_token() -> Token {
+		Token::new(
+			USE_MANIFEST_VERSION,
+			"Manifest version for generate-manifest. Defaults to 1.",
+		)
+		.takes_value(true)
 	}
 	fn namespace_dir_token() -> Token {
 		Token::new(
@@ -599,6 +603,15 @@ impl Command {
 			.takes_value(true)
 	}
 
+	fn dns_resolvers_token() -> Token {
+		Token::new(
+			DNS_RESOLVERS,
+			"Comma separated, [] wrapped DNS resolver IPs for manifest v2. e.g. `[1.1.1.1,8.8.8.8]`",
+		)
+		.required(false)
+		.takes_value(true)
+	}
+
 	fn base() -> Parser {
 		Parser::new()
 			.token(
@@ -680,11 +693,13 @@ impl Command {
 			.token(Self::manifest_path_token())
 			.token(Self::manifest_set_dir_token())
 			.token(Self::share_set_dir_token())
-			.token(Self::patch_set_dir_token())
+			.token(Self::patch_set_dir_optional_token())
 			.token(Self::quorum_key_path_token())
 			.token(Self::pivot_args_token())
 			.token(Self::bridge_config_token())
+			.token(Self::dns_resolvers_token())
 			.token(Self::debug_mode_token())
+			.token(Self::use_manifest_version_token())
 	}
 
 	fn approve_manifest() -> Parser {
@@ -700,7 +715,7 @@ impl Command {
 			.token(Self::quorum_key_path_token())
 			.token(Self::manifest_set_dir_token())
 			.token(Self::share_set_dir_token())
-			.token(Self::patch_set_dir_token())
+			.token(Self::patch_set_dir_optional_token())
 			.token(Self::unsafe_auto_confirm_token())
 	}
 
@@ -929,18 +944,18 @@ impl ClientOpts {
 	}
 
 	fn alias(&self) -> String {
-		self.parsed.single(ALIAS).expect("required arg").to_string()
+		self.parsed.single(ALIAS).expect("required arg").clone()
 	}
 
 	fn namespace(&self) -> String {
-		self.parsed.single(NAMESPACE).expect("required arg").to_string()
+		self.parsed.single(NAMESPACE).expect("required arg").clone()
 	}
 
 	fn pcr3_preimage_path(&self) -> String {
 		self.parsed
 			.single(PCR3_PREIMAGE_PATH)
 			.expect("`--pcr3-preimage-path` is a required arg")
-			.to_string()
+			.clone()
 	}
 
 	fn nonce(&self) -> u32 {
@@ -955,62 +970,67 @@ impl ClientOpts {
 		self.parsed
 			.single(RESTART_POLICY)
 			.expect("required arg")
-			.to_string()
+			.clone()
 			.try_into()
 			.expect("Could not parse `--restart-policy`")
 	}
 
 	fn pivot_path(&self) -> String {
-		self.parsed.single(PIVOT_PATH).expect("required arg").to_string()
+		self.parsed.single(PIVOT_PATH).expect("required arg").clone()
 	}
 
 	fn manifest_set_dir(&self) -> String {
 		self.parsed
 			.single(MANIFEST_SET_DIR)
 			.expect("`--manifest-set-dir` is a required arg")
-			.to_string()
+			.clone()
 	}
 
 	fn share_set_dir(&self) -> String {
 		self.parsed
 			.single(SHARE_SET_DIR)
 			.expect("`--share-set-dir` is a required arg")
-			.to_string()
+			.clone()
 	}
 
-	fn patch_set_dir(&self) -> String {
+	fn patch_set_dir(&self) -> Option<String> {
+		self.parsed.single(PATCH_SET_DIR).map(ToString::to_string)
+	}
+
+	fn use_manifest_version(&self) -> u32 {
 		self.parsed
-			.single(PATCH_SET_DIR)
-			.expect("`--patch-set-dir` is a required arg")
-			.to_string()
+			.single(USE_MANIFEST_VERSION)
+			.map_or("1", String::as_str)
+			.parse::<u32>()
+			.expect("Could not parse `--use-manifest-version` as u32")
 	}
 
 	fn namespace_dir(&self) -> String {
 		self.parsed
 			.single(NAMESPACE_DIR)
 			.expect("`--namespace-dir` is a required arg")
-			.to_string()
+			.clone()
 	}
 
 	fn manifest_approvals_dir(&self) -> String {
 		self.parsed
 			.single(MANIFEST_APPROVALS_DIR)
 			.expect("`--manifest-approval-dir` is a required arg")
-			.to_string()
+			.clone()
 	}
 
 	fn qos_release_dir(&self) -> String {
 		self.parsed
 			.single(QOS_REALEASE_DIR)
 			.expect("qos-release-dir is a required arg")
-			.to_string()
+			.clone()
 	}
 
 	fn pivot_hash_path(&self) -> String {
 		self.parsed
 			.single(PIVOT_HASH_PATH)
 			.expect("pivot-hash is a required arg")
-			.to_string()
+			.clone()
 	}
 
 	fn pivot_args(&self) -> Vec<String> {
@@ -1056,6 +1076,37 @@ impl ClientOpts {
 		}
 	}
 
+	fn dns_resolvers(&self) -> Option<Vec<IpAddr>> {
+		self.parsed.single(DNS_RESOLVERS).map(|v| {
+			let mut chars = v.chars();
+
+			assert_eq!(
+				chars.next().unwrap(),
+				'[',
+				"DNS resolvers must start with a \"[\""
+			);
+			assert_eq!(
+				chars.next_back().unwrap(),
+				']',
+				"DNS resolvers must end with a \"]\""
+			);
+
+			if chars.clone().count() > 0 {
+				chars
+					.as_str()
+					.split(',')
+					.map(|resolver| {
+						resolver.parse().expect(
+							"Could not parse DNS resolver as IP address",
+						)
+					})
+					.collect()
+			} else {
+				vec![]
+			}
+		})
+	}
+
 	fn debug_mode(&self) -> bool {
 		self.parsed
 			.single(DEBUG_MODE)
@@ -1065,7 +1116,7 @@ impl ClientOpts {
 	}
 
 	fn pub_path(&self) -> String {
-		self.parsed.single(PUB_PATH).expect("Missing `--pub-path`").to_string()
+		self.parsed.single(PUB_PATH).expect("Missing `--pub-path`").clone()
 	}
 
 	fn secret_path(&self) -> Option<String> {
@@ -1073,38 +1124,35 @@ impl ClientOpts {
 	}
 
 	fn share_path(&self) -> String {
-		self.parsed
-			.single(SHARE_PATH)
-			.expect("Missing `--share-path`")
-			.to_string()
+		self.parsed.single(SHARE_PATH).expect("Missing `--share-path`").clone()
 	}
 
 	fn output_path(&self) -> String {
 		self.parsed
 			.single(OUTPUT_PATH)
 			.expect("Missing `--output-path`")
-			.to_string()
+			.clone()
 	}
 
 	fn quorum_key_path(&self) -> String {
 		self.parsed
 			.single(QUORUM_KEY_PATH)
 			.expect("Missing `--quorum-key-path`")
-			.to_string()
+			.clone()
 	}
 
 	fn manifest_path(&self) -> String {
 		self.parsed
 			.single(MANIFEST_PATH)
 			.expect("Missing `--manifest-path`")
-			.to_string()
+			.clone()
 	}
 
 	fn manifest_envelope_path(&self) -> String {
 		self.parsed
 			.single(MANIFEST_ENVELOPE_PATH)
 			.expect("Missing `--manifest-envelope-path`")
-			.to_string()
+			.clone()
 	}
 
 	fn maybe_manifest_envelope_path(&self) -> Option<String> {
@@ -1115,35 +1163,32 @@ impl ClientOpts {
 		self.parsed
 			.single(APPROVAL_PATH)
 			.expect("Missing `--approval-path`")
-			.to_string()
+			.clone()
 	}
 
 	fn eph_wrapped_share_path(&self) -> String {
 		self.parsed
 			.single(EPH_WRAPPED_SHARE_PATH)
 			.expect("Missing `--eph-wrapped-share-path`")
-			.to_string()
+			.clone()
 	}
 
 	fn attestation_doc_path(&self) -> String {
 		self.parsed
 			.single(ATTESTATION_DOC_PATH)
 			.expect("Missing `--attestation-doc-path`")
-			.to_string()
+			.clone()
 	}
 
 	fn master_seed_path(&self) -> String {
 		self.parsed
 			.single(MASTER_SEED_PATH)
 			.expect("Missing `--master-seed-path`")
-			.to_string()
+			.clone()
 	}
 
 	fn output_dir(&self) -> String {
-		self.parsed
-			.single(OUTPUT_DIR)
-			.expect("Missing `--output-dir`")
-			.to_string()
+		self.parsed.single(OUTPUT_DIR).expect("Missing `--output-dir`").clone()
 	}
 
 	fn shares(&self) -> Vec<String> {
@@ -1167,35 +1212,32 @@ impl ClientOpts {
 	}
 
 	fn payload(&self) -> String {
-		self.parsed.single(PAYLOAD).expect("Missing `--payload`").to_string()
+		self.parsed.single(PAYLOAD).expect("Missing `--payload`").clone()
 	}
 
 	fn payload_path(&self) -> String {
 		self.parsed
 			.single(PAYLOAD_PATH)
 			.expect("Missing `--payload-path`")
-			.to_string()
+			.clone()
 	}
 
 	fn signature_path(&self) -> String {
 		self.parsed
 			.single(SIGNATURE_PATH)
 			.expect("Missing `--signature-path`")
-			.to_string()
+			.clone()
 	}
 
 	fn ephemeral_key_path(&self) -> String {
 		self.parsed
 			.single(EPHEMERAL_KEY_PATH)
 			.expect("Missing `--ephemeral-key-path`")
-			.to_string()
+			.clone()
 	}
 
 	fn file_path(&self) -> String {
-		self.parsed
-			.single(FILE_PATH)
-			.expect("Missing `--file-path`")
-			.to_string()
+		self.parsed.single(FILE_PATH).expect("Missing `--file-path`").clone()
 	}
 
 	fn display_type(&self) -> DisplayType {
@@ -1214,7 +1256,7 @@ impl ClientOpts {
 		self.parsed
 			.single(NEW_PIN_PATH)
 			.expect("Missing `--new-pin-path`")
-			.to_string()
+			.clone()
 	}
 
 	fn current_pin_path(&self) -> Option<String> {
@@ -1231,21 +1273,21 @@ impl ClientOpts {
 		self.parsed
 			.single(ENCRYPTED_QUORUM_KEY_PATH)
 			.expect("Missing `--encrypted-quorum-key-path`")
-			.to_string()
+			.clone()
 	}
 
 	fn plaintext_path(&self) -> String {
 		self.parsed
 			.single(PLAINTEXT_PATH)
 			.expect("Missing `--plaintext-path`")
-			.to_string()
+			.clone()
 	}
 
 	fn ciphertext_path(&self) -> String {
 		self.parsed
 			.single(CIPHERTEXT_PATH)
 			.expect("Missing `--ciphertext-path`")
-			.to_string()
+			.clone()
 	}
 
 	fn yubikey(&self) -> bool {
@@ -1283,13 +1325,13 @@ impl ClientRunner {
 	pub fn new(args: &mut Vec<String>) -> Self {
 		let result = CommandParser::<Command>::parse(args);
 
-		if let Ok((cmd, parsed)) = result {
-			Self { cmd, opts: ClientOpts { parsed } }
-		} else {
-			println!("Invalid input, try using --help with any of the following commands");
-			Command::print_all();
+		match result {
+			Ok((cmd, parsed)) => Self { cmd, opts: ClientOpts { parsed } },
+			Err(err) => {
+				println!("Invalid input: {err}");
 
-			std::process::exit(1);
+				std::process::exit(1);
+			}
 		}
 	}
 
@@ -1398,8 +1440,8 @@ mod handlers {
 	use super::services::{ApproveManifestArgs, ProxyReEncryptShareArgs};
 	use crate::{
 		cli::{
-			services::{self, GenerateManifestArgs, PairOrYubi},
 			ClientOpts, ProtocolMsg,
+			services::{self, GenerateManifestArgs, PairOrYubi},
 		},
 		request,
 	};
@@ -1407,7 +1449,9 @@ mod handlers {
 	pub(super) fn pivot_hash(opts: &ClientOpts) {
 		let pivot_path = opts.pivot_path();
 		let pivot = std::fs::read(&pivot_path).unwrap_or_else(|e| {
-			panic!("pivot_hash: Could not read pivot file from {pivot_path:?}: {e}")
+			panic!(
+				"pivot_hash: Could not read pivot file from {pivot_path:?}: {e}"
+			)
 		});
 
 		let hash = qos_crypto::sha_256(&pivot);
@@ -1415,7 +1459,9 @@ mod handlers {
 
 		let output_path = opts.output_path();
 		std::fs::write(&output_path, hex_hash.as_bytes()).unwrap_or_else(|e| {
-			panic!("pivot_hash: Could not write pivot hash to {output_path:?}: {e}")
+			panic!(
+				"pivot_hash: Could not write pivot hash to {output_path:?}: {e}"
+			)
 		});
 	}
 
@@ -1608,7 +1654,7 @@ mod handlers {
 	}
 
 	pub(super) fn generate_manifest(opts: &ClientOpts) {
-		if let Err(e) = services::generate_manifest(GenerateManifestArgs {
+		let args = GenerateManifestArgs {
 			nonce: opts.nonce(),
 			namespace: opts.namespace(),
 			restart_policy: opts.restart_policy(),
@@ -1622,8 +1668,20 @@ mod handlers {
 			patch_set_dir: opts.patch_set_dir(),
 			quorum_key_path: opts.quorum_key_path(),
 			bridge_config: opts.bridge_config(),
+			dns_resolvers: opts.dns_resolvers(),
 			debug_mode: opts.debug_mode(),
-		}) {
+		};
+		let result = match opts.use_manifest_version() {
+			1 => services::generate_manifest(args),
+			2 => services::generate_manifest_v2(args),
+			version => {
+				eprintln!(
+					"Error: unsupported manifest version {version}; expected 1 or 2"
+				);
+				std::process::exit(1);
+			}
+		};
+		if let Err(e) = result {
 			println!("Error: {e:?}");
 			std::process::exit(1);
 		}
@@ -1869,5 +1927,81 @@ mod handlers {
 			eprintln!("Error: {e:?}");
 			std::process::exit(1);
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use qos_core::parser::CommandParser;
+
+	use super::{ClientOpts, Command};
+
+	fn generate_manifest_args() -> Vec<String> {
+		vec![
+			"qos_client".to_string(),
+			"generate-manifest".to_string(),
+			"--nonce".to_string(),
+			"1".to_string(),
+			"--namespace".to_string(),
+			"ns".to_string(),
+			"--pivot-hash-path".to_string(),
+			"/tmp/pivot-hash".to_string(),
+			"--restart-policy".to_string(),
+			"never".to_string(),
+			"--qos-release-dir".to_string(),
+			"/tmp/qos-release".to_string(),
+			"--pcr3-preimage-path".to_string(),
+			"/tmp/pcr3".to_string(),
+			"--manifest-path".to_string(),
+			"/tmp/manifest".to_string(),
+			"--manifest-set-dir".to_string(),
+			"/tmp/manifest-set".to_string(),
+			"--share-set-dir".to_string(),
+			"/tmp/share-set".to_string(),
+			"--quorum-key-path".to_string(),
+			"/tmp/quorum-key".to_string(),
+			"--pivot-args".to_string(),
+			"[]".to_string(),
+		]
+	}
+
+	#[test]
+	fn generate_manifest_defaults_to_manifest_version_1() {
+		let mut args = generate_manifest_args();
+		let (cmd, parsed) = CommandParser::<Command>::parse(&mut args).unwrap();
+
+		assert_eq!(cmd, Command::GenerateManifest);
+		let opts = ClientOpts { parsed };
+		assert_eq!(opts.use_manifest_version(), 1);
+		assert_eq!(opts.patch_set_dir(), None);
+	}
+
+	#[test]
+	fn generate_manifest_parses_manifest_version_2() {
+		let mut args = generate_manifest_args();
+		args.extend([
+			"--use-manifest-version".to_string(),
+			"2".to_string(),
+			"--patch-set-dir".to_string(),
+			"/tmp/patch-set".to_string(),
+		]);
+		let (cmd, parsed) = CommandParser::<Command>::parse(&mut args).unwrap();
+
+		assert_eq!(cmd, Command::GenerateManifest);
+		let opts = ClientOpts { parsed };
+		assert_eq!(opts.use_manifest_version(), 2);
+		assert_eq!(opts.patch_set_dir().as_deref(), Some("/tmp/patch-set"));
+	}
+
+	#[test]
+	fn generate_manifest_parses_manifest_version_1_explicitly() {
+		let mut args = generate_manifest_args();
+		args.extend(["--use-manifest-version".to_string(), "1".to_string()]);
+		let (cmd, parsed) = CommandParser::<Command>::parse(&mut args).unwrap();
+
+		assert_eq!(cmd, Command::GenerateManifest);
+		let opts = ClientOpts { parsed };
+		assert_eq!(opts.use_manifest_version(), 1);
+		assert_eq!(opts.patch_set_dir(), None);
 	}
 }

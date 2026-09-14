@@ -1,4 +1,9 @@
-name: stagex-build CI # build check for PR and main
+name: stagex-build CI # read-only build check for PR and main
+
+# Cancel superseded runs for a given PR or branch
+concurrency:
+  cancel-in-progress: true
+  group: "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}"
 
 on:
   push:
@@ -6,22 +11,52 @@ on:
       - main
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   build:
-    name: build artifacts
-    runs-on: ubicloud-standard-16
-    permissions:
-      contents: read
-      packages: read
+    name: build ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      # One job per image so builds/pushes run in parallel. Don't cancel the
+      # other images if one fails.
+      fail-fast: false
+      matrix:
+        name:
+          - qos_client
+          - qos_host
+          - qos_host_qemu
+          - qos_enclave
+          - qos_enclave_egress
+          - qos_bridge
+          - qos_bridge_qemu
+          - qos_bridge_egress
+          - signed_echo
     steps:
       - name: Checkout sources
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Setup Docker
         uses: ./.github/actions/docker-setup
-        with:
-          ghcr: ${{ secrets.GITHUB_TOKEN }}
 
+      # Build only this matrix image (the `common` base is built as a dependency).
       - name: Run `make`
         shell: 'script -q -e -c "bash {0}"'
-        run: make -j$(nproc)
+        run: make -j$(nproc) "out/${{ matrix.name }}/index.json"
+
+  # Single aggregate check that branch protection can require (the matrix above
+  # produces one check per image). Passes only if every image job succeeded.
+  build-artifacts:
+    name: build artifacts
+    needs: build
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify all image builds succeeded
+        run: |
+          result="${{ needs.build.result }}"
+          if [ "${result}" != "success" ]; then
+            echo "One or more image build jobs did not succeed (result: ${result})" >&2
+            exit 1
+          fi

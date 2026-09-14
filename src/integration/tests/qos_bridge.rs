@@ -7,10 +7,11 @@ use std::{
 
 use borsh::de::BorshDeserialize;
 use integration::{
-	wait_for_tcp_sock, PivotSocketStressMsg, LOCAL_HOST, PCR3_PRE_IMAGE_PATH,
-	PIVOT_SOCKET_STRESS_PATH, QOS_DIST_DIR,
+	LOCAL_HOST, PCR3_PRE_IMAGE_PATH, PIVOT_SOCKET_STRESS_PATH,
+	PivotSocketStressMsg, QOS_DIST_DIR, wait_for_tcp_sock,
 };
 use qos_core::protocol::{
+	ProtocolPhase, QosHash,
 	services::{
 		boot::{
 			Approval, BridgeConfig, Manifest, ManifestSet, Namespace,
@@ -18,7 +19,6 @@ use qos_core::protocol::{
 		},
 		genesis::{GenesisMemberOutput, GenesisOutput},
 	},
-	ProtocolPhase, QosHash,
 };
 use qos_crypto::sha_256;
 use qos_host::EnclaveInfo;
@@ -28,6 +28,42 @@ use tokio::{
 	io::{AsyncReadExt, AsyncWriteExt},
 	net::TcpStream,
 };
+
+async fn bridge_roundtrip(
+	bridge_addr: &str,
+) -> Result<PivotSocketStressMsg, String> {
+	let mut tcp_stream =
+		TcpStream::connect(bridge_addr).await.map_err(|e| e.to_string())?;
+
+	let msg = PivotSocketStressMsg::OkRequest(42);
+	let msg_bytes = borsh::to_vec(&msg).map_err(|e| e.to_string())?;
+	let mut header = (msg_bytes.len() as u64).to_le_bytes();
+
+	tcp_stream.write_all(&header).await.map_err(|e| e.to_string())?;
+	tcp_stream.write_all(&msg_bytes).await.map_err(|e| e.to_string())?;
+
+	tcp_stream.read_exact(&mut header).await.map_err(|e| e.to_string())?;
+	let reply_size = usize::from_le_bytes(header);
+	let mut reply_bytes = vec![0u8; reply_size];
+	tcp_stream.read_exact(&mut reply_bytes).await.map_err(|e| e.to_string())?;
+
+	borsh::from_slice(&reply_bytes).map_err(|e| e.to_string())
+}
+
+async fn wait_for_bridge_roundtrip(bridge_addr: &str) {
+	let mut last_err = String::new();
+	for _ in 0..100 {
+		match bridge_roundtrip(bridge_addr).await {
+			Ok(PivotSocketStressMsg::OkResponse(42)) => return,
+			Ok(reply) => panic!("invalid pivot response: {reply:?}"),
+			Err(err) => last_err = err,
+		}
+
+		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+	}
+
+	panic!("unable to complete bridge roundtrip via {bridge_addr}: {last_err}");
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn qos_bridge_works() {
@@ -208,6 +244,12 @@ async fn qos_bridge_works() {
 
 		assert_eq!(
 			&stdout.next().unwrap().unwrap(),
+			"Is this the correct manifest schema version: v1? (y/n)"
+		);
+		stdin.write_all("y\n".as_bytes()).expect("Failed to write to stdin");
+
+		assert_eq!(
+			&stdout.next().unwrap().unwrap(),
 			"Is this the correct namespace name: quit-coding-to-vape? (y/n)"
 		);
 		stdin.write_all("y\n".as_bytes()).expect("Failed to write to stdin");
@@ -240,7 +282,28 @@ async fn qos_bridge_works() {
 		);
 		assert_eq!(
 			&stdout.next().unwrap().unwrap(),
-			&format!("[\"/tmp/qos_host_bridge/qos_host_bridge.sock.{app_host_port}.appsock\"]?")
+			&format!(
+				"[\"/tmp/qos_host_bridge/qos_host_bridge.sock.{app_host_port}.appsock\"]?"
+			)
+		);
+		assert_eq!(&stdout.next().unwrap().unwrap(), "(y/n)");
+		stdin.write_all("y\n".as_bytes()).expect("Failed to write to stdin");
+
+		assert_eq!(
+			&stdout.next().unwrap().unwrap(),
+			"Is this the correct pivot debug mode: false? (y/n)"
+		);
+		stdin.write_all("y\n".as_bytes()).expect("Failed to write to stdin");
+
+		assert_eq!(
+			&stdout.next().unwrap().unwrap(),
+			"Is this the correct pivot bridge configuration:"
+		);
+		assert_eq!(
+			&stdout.next().unwrap().unwrap(),
+			&format!(
+				"[Server {{ port: {app_host_port}, host: \"0.0.0.0\" }}]?"
+			)
 		);
 		assert_eq!(&stdout.next().unwrap().unwrap(), "(y/n)");
 		stdin.write_all("y\n".as_bytes()).expect("Failed to write to stdin");
@@ -321,63 +384,69 @@ async fn qos_bridge_works() {
 			.into();
 
 	// -- CLIENT generate the manifest envelope
-	assert!(Command::new(integration::QOS_CLIENT_PATH)
-		.args([
-			"generate-manifest-envelope",
-			"--manifest-approvals-dir",
-			boot_dir.to_str().unwrap(),
-			"--manifest-path",
-			cli_manifest_path.to_str().unwrap(),
-		])
-		.spawn()
-		.unwrap()
-		.wait()
-		.unwrap()
-		.success());
-
-	// -- CLIENT broadcast boot standard instruction
-	let manifest_envelope_path = boot_dir.join("manifest_envelope");
-	assert!(Command::new(integration::QOS_CLIENT_PATH)
-		.args([
-			"boot-standard",
-			"--manifest-envelope-path",
-			manifest_envelope_path.to_str().unwrap(),
-			"--pivot-path",
-			PIVOT_SOCKET_STRESS_PATH,
-			"--host-port",
-			&host_port.to_string(),
-			"--host-ip",
-			LOCAL_HOST,
-			"--pcr3-preimage-path",
-			"./mock/pcr3-preimage.txt",
-			"--unsafe-skip-attestation",
-		])
-		.spawn()
-		.unwrap()
-		.wait()
-		.unwrap()
-		.success());
-
-	// For each user, post a share,
-	for user in [&user1, &user2] {
-		// Get attestation doc and manifest
-		assert!(Command::new(integration::QOS_CLIENT_PATH)
+	assert!(
+		Command::new(integration::QOS_CLIENT_PATH)
 			.args([
-				"get-attestation-doc",
-				"--host-port",
-				&host_port.to_string(),
-				"--host-ip",
-				LOCAL_HOST,
-				"--attestation-doc-path",
-				attestation_doc_path.to_str().unwrap(),
-				"--manifest-envelope-path",
-				"/tmp/dont_care"
+				"generate-manifest-envelope",
+				"--manifest-approvals-dir",
+				boot_dir.to_str().unwrap(),
+				"--manifest-path",
+				cli_manifest_path.to_str().unwrap(),
 			])
 			.spawn()
 			.unwrap()
 			.wait()
 			.unwrap()
-			.success());
+			.success()
+	);
+
+	// -- CLIENT broadcast boot standard instruction
+	let manifest_envelope_path = boot_dir.join("manifest_envelope");
+	assert!(
+		Command::new(integration::QOS_CLIENT_PATH)
+			.args([
+				"boot-standard",
+				"--manifest-envelope-path",
+				manifest_envelope_path.to_str().unwrap(),
+				"--pivot-path",
+				PIVOT_SOCKET_STRESS_PATH,
+				"--host-port",
+				&host_port.to_string(),
+				"--host-ip",
+				LOCAL_HOST,
+				"--pcr3-preimage-path",
+				"./mock/pcr3-preimage.txt",
+				"--unsafe-skip-attestation",
+			])
+			.spawn()
+			.unwrap()
+			.wait()
+			.unwrap()
+			.success()
+	);
+
+	// For each user, post a share,
+	for user in [&user1, &user2] {
+		// Get attestation doc and manifest
+		assert!(
+			Command::new(integration::QOS_CLIENT_PATH)
+				.args([
+					"get-attestation-doc",
+					"--host-port",
+					&host_port.to_string(),
+					"--host-ip",
+					LOCAL_HOST,
+					"--attestation-doc-path",
+					attestation_doc_path.to_str().unwrap(),
+					"--manifest-envelope-path",
+					"/tmp/dont_care"
+				])
+				.spawn()
+				.unwrap()
+				.wait()
+				.unwrap()
+				.success()
+		);
 
 		let share_path = personal_dir(user).join(format!("{user}.share"));
 		let secret_path = personal_dir(user).join(format!("{user}.secret"));
@@ -442,9 +511,9 @@ async fn qos_bridge_works() {
 		stdin.write_all("yes\n".as_bytes()).expect("Failed to write to stdin");
 
 		assert_eq!(
-				&stdout.next().unwrap().unwrap(),
-				"Does this AWS IAM role belong to the intended organization: arn:aws:iam::123456789012:role/Webserver? (y/n)"
-			);
+			&stdout.next().unwrap().unwrap(),
+			"Does this AWS IAM role belong to the intended organization: arn:aws:iam::123456789012:role/Webserver? (y/n)"
+		);
 		stdin.write_all("yes\n".as_bytes()).expect("Failed to write to stdin");
 
 		assert_eq!(
@@ -457,23 +526,25 @@ async fn qos_bridge_works() {
 		assert!(child.wait().unwrap().success());
 
 		// Post the encrypted share
-		assert!(Command::new(integration::QOS_CLIENT_PATH)
-			.args([
-				"post-share",
-				"--host-port",
-				&host_port.to_string(),
-				"--host-ip",
-				LOCAL_HOST,
-				"--eph-wrapped-share-path",
-				eph_wrapped_share_path.to_str().unwrap(),
-				"--approval-path",
-				approval_path.to_str().unwrap(),
-			])
-			.spawn()
-			.unwrap()
-			.wait()
-			.unwrap()
-			.success());
+		assert!(
+			Command::new(integration::QOS_CLIENT_PATH)
+				.args([
+					"post-share",
+					"--host-port",
+					&host_port.to_string(),
+					"--host-ip",
+					LOCAL_HOST,
+					"--eph-wrapped-share-path",
+					eph_wrapped_share_path.to_str().unwrap(),
+					"--approval-path",
+					approval_path.to_str().unwrap(),
+				])
+				.spawn()
+				.unwrap()
+				.wait()
+				.unwrap()
+				.success()
+		);
 	}
 
 	let enclave_info_url =
@@ -489,34 +560,7 @@ async fn qos_bridge_works() {
 	let bridge_addr = format!("127.0.0.1:{app_host_port_override}");
 	wait_for_tcp_sock(&bridge_addr).await;
 
-	// send a PivotSocketStressMsg to check if the  bridge works all the way
-	let mut tcp_stream = TcpStream::connect(&bridge_addr).await.unwrap();
-
-	let msg = PivotSocketStressMsg::OkRequest(42);
-	let msg_bytes = borsh::to_vec(&msg).unwrap();
-	let mut header = (msg_bytes.len() as u64).to_le_bytes();
-
-	// send the header/length
-	tcp_stream.write_all(&header).await.unwrap();
-	// send the msg
-	tcp_stream.write_all(&msg_bytes).await.unwrap();
-
-	// receive the reply header
-	assert_eq!(8, tcp_stream.read_exact(&mut header).await.unwrap());
-	let reply_size = usize::from_le_bytes(header);
-	let mut reply_bytes = vec![0u8; reply_size];
-	// receive the reply msg
-	assert_eq!(
-		reply_size,
-		tcp_stream.read_exact(&mut reply_bytes).await.unwrap()
-	);
-	// decode the reply msg
-	let reply: PivotSocketStressMsg = borsh::from_slice(&reply_bytes).unwrap();
-
-	match reply {
-		PivotSocketStressMsg::OkResponse(val) => assert_eq!(val, 42),
-		_ => panic!("invalid pivot response"),
-	}
+	wait_for_bridge_roundtrip(&bridge_addr).await;
 
 	// test qos_bridge restart after enclave is up
 	bridge_child_process.kill().expect("unable to kill qos_host");
@@ -541,32 +585,5 @@ async fn qos_bridge_works() {
 	let bridge_addr = format!("127.0.0.1:{app_host_port_override}");
 	wait_for_tcp_sock(&bridge_addr).await;
 
-	// send a PivotSocketStressMsg to check if the  bridge works all the way
-	let mut tcp_stream = TcpStream::connect(&bridge_addr).await.unwrap();
-
-	let msg = PivotSocketStressMsg::OkRequest(42);
-	let msg_bytes = borsh::to_vec(&msg).unwrap();
-	let mut header = (msg_bytes.len() as u64).to_le_bytes();
-
-	// send the header/length
-	tcp_stream.write_all(&header).await.unwrap();
-	// send the msg
-	tcp_stream.write_all(&msg_bytes).await.unwrap();
-
-	// receive the reply header
-	assert_eq!(8, tcp_stream.read_exact(&mut header).await.unwrap());
-	let reply_size = usize::from_le_bytes(header);
-	let mut reply_bytes = vec![0u8; reply_size];
-	// receive the reply msg
-	assert_eq!(
-		reply_size,
-		tcp_stream.read_exact(&mut reply_bytes).await.unwrap()
-	);
-	// decode the reply msg
-	let reply: PivotSocketStressMsg = borsh::from_slice(&reply_bytes).unwrap();
-
-	match reply {
-		PivotSocketStressMsg::OkResponse(val) => assert_eq!(val, 42),
-		_ => panic!("invalid pivot response"),
-	}
+	wait_for_bridge_roundtrip(&bridge_addr).await;
 }

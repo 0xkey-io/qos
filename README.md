@@ -2,7 +2,7 @@
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://github.com/tkhq/qos/blob/main/LICENSE) 
 [![stagex-build Status](https://github.com/tkhq/qos/actions/workflows/stagex.yml/badge.svg)](https://github.com/tkhq/qos/actions/workflows/stagex.yml) 
-[![stagex-build Status](https://github.com/tkhq/qos/actions/workflows/pr.yml/badge.svg)](https://github.com/tkhq/qos/actions/workflows/pr.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/tkhq/qos/pr.yml?branch=main&label=CI)](https://github.com/tkhq/qos/actions/workflows/pr.yml?query=branch%3Amain)
 
 ## About
 
@@ -81,7 +81,37 @@ make -C src test
 
 All tests must pass.
 
-PRs also need to pass the `build-linux-only` job (part of the `pr` workflow). There are 3 crates excluded from the Rust workspace: `qos_system`, `qos_aws`, and `init`. These crates are excluded because they only build on Linux. If you are not working directly with these crates they generally only need to be updated if the dependencies for `qos_core` change. The linux only crates each have their own lockfile and that will need to be up to date for deterministic builds to work. To update the locks files you will need a linux build environment. Once in a linux build environment you can run `make build-linux-only`, which updates lock files if necessary; any updated lock files should then be committed.
+PRs also need to pass the `build-linux-only` job (part of the `pr` workflow). There are 3 crates excluded from the Rust workspace: `qos_system`, `qos_aws`, and `init`. These crates are excluded because they only build on Linux. If you are not working directly with these crates they generally only need to be updated if the dependencies for `qos_core` change. The linux only crates each have their own lockfile and that will need to be up to date for deterministic builds to work. Deliberately refresh stale lock files with Cargo in a Linux build environment, then review and commit those changes. `make build-linux-only` verifies the committed locks with `--locked` and fails if they need updating.
+
+### Running in qemu
+
+NOTE: this has only been tested on a linux x86_64 host
+
+#### Dependencies
+
+Some additional dependencies are needed in order to run `qos` in the `nitro-enclave` machine in `qemu`.
+
+1. [vhost-device-vsock](https://github.com/rust-vmm/vhost-device/blob/main/vhost-device-vsock/README.md) is required to provide the hypervisor link for the vsock
+2. [qemu](https://www.qemu.org/) itself needs to be installed, `v11.0.0` or later
+
+#### Egress support on host
+
+To setup the egress tunnel you need root priviledges on the host machine and know your main internet route interface.
+Run `src/scripts/enclave_egress_interfaces.sh <interface>` after each boot to provide the egress tunnel setup.
+
+#### Running
+
+Run `make qemu` to start a bare-bones qos instance that will await boot instructions.
+This initiates local vsock on cid `1` and port `9001` for control and `9002` for egress and starts the enclave. The unix socket connector is at `/tmp/vhost4.socket`.
+
+You can follow up by running `make host` and booting up the enclave.
+You can also run the bridges by running `make bridge` which expects port `3000` to be used for the app host port.
+Egress is enabled by default for the qemu setup and should start provided the manifest has egress defined.
+
+
+To do a boot standard without needing manual steps, run `make boot`. You can override the pivot binary and arguments used for this by providing them in the `PIVOT_BIN` and `PIVOT_ARGS` env vars (don't forget that pivot args are in the format of `[arg1,arg2]`). The default program will attempt a download of a ~1MB file.
+
+To stop the enclave and qemu run `make stop`.
 
 ## Releases
 
@@ -146,6 +176,8 @@ If something goes wrong during a release and you want to retry, you can open a P
 
 A set of 3 keys used for authentication, public key encryption, and encryption at rest. They are derived from a single seed. See the [QOS Key Set Specification](./src/qos_p256/SPEC.md) for details. The Quorum Key should only ever be reconstituted inside of an enclave. Additionally, the full provisioning of the Quorum Key concludes the attestation flow, at which point QuorumOS pivots to launching the specified enclave app. At rest, outside of the enclave, the key is intended to be stored across shares using shamir's secret sharing. Note that key shares are always intended to be stored encrypted to the Personal Key, never in plaintext.
 
+You can learn more about how to use the quorum key in [Enclave Keys](docs/enclave_keys.md).
+
 ### Operator
 
 An entity that may be a member of the [Manifest Set](#manifest-set) and/or [Share Set](#share-set). Operators use the P256 Signing and P256 HPKE schemes from the [QOS Key Set](./src/qos_p256/SPEC.md).
@@ -164,7 +196,7 @@ The collection of members who each hold shares of the Quorum Key and thus provis
 
 ### Ephemeral Key
 
-An asymmetric key that is generated by a QuorumOS instance immediately after boot. Once Quorum Members are able to verify the integrity of a QuorumOS instance, they encrypt their Quorum Key shares to the Ephemeral Key and submit to the instance for reconstruction.
+An asymmetric key generated by a QuorumOS instance. QOS uses a setup Ephemeral Key for provisioning and key forwarding, then rotates to a precommitted live Ephemeral Key for app-level use. Once Quorum Members verify setup attestation, they encrypt their Quorum Key shares to the setup Ephemeral Key and submit them to the instance for reconstruction. You can learn more about how to use ephemeral keys in [Enclave Keys](docs/enclave_keys.md).
 
 ### Manifest
 
@@ -186,13 +218,13 @@ The application QuorumOS pivots to once it finishes booting. This application's 
 
 There are two modes for provisioning:
 
-- [Boot Standard](docs/boot_standard.md): mode for provisioning an enclave with quorum key shares. This is commonly used if there is no instance from the same namespace to key forward from or if there is any change to the QuorumOS verification API that breaks Key Forwarding. Boot Standard is also required if the manifest set or share set change.
+- [Boot Standard](docs/boot_standard.md): mode for provisioning an enclave with quorum key shares. This is required when there is no provisioned instance in the namespace to key forward from (first boot after genesis, or all nodes lost), when the manifest set or PCR3 (host IAM role) changes, or when a QuorumOS change breaks Key Forwarding itself. See [When Is Boot Standard Required?](docs/boot_standard.md#when-is-boot-standard-required) for the full decision rule.
 - [Key Forward](docs/key_forward.md): mode for provisioning an enclave from an already provisioned enclave of the same namespace. This allows QuorumOS to support horizontal scaling cloud workloads. Effectively, a pre-existing enclave will verify attestation and manifest for a new enclave and then forward its quorum key to the new enclave.
 
 ### Remote Attestation
 
 The purpose of remote attestation is to prove that an environment is running a particular piece of software. In the case of AWS Nitro Enclaves, an enclave can uniquely asks the Nitro Security Module (NSM) for an attestation document containing details of the enclave. This document is signed by the Nitro Attestation PKI and is tied back to the AWS Nitro Attestation PKI Root.
-As defined in the [AWS documentation](https://docs.aws.amazon.com/enclaves/latest/user/verify-root.html) the instance can request the Nitro Security Module (NSM) to produce an attestation document on its behalf. Additionally, the attestation document contains two fields that can be modified by the enclave itself. The attestation document request contains the Ephemeral Key and the hash of manifest so Share Set members can verify the data is correct.
+As defined in the [AWS documentation](https://docs.aws.amazon.com/enclaves/latest/user/verify-root.html) the instance can request the Nitro Security Module (NSM) to produce an attestation document on its behalf. QOS attestation requests carry the manifest hash in `user_data` and the relevant Ephemeral Key public key in `public_key`. Setup/provisioning attestations verify the setup key with PCR16; live/app attestations verify the live key with PCR17. Most App Proof verifiers only need the PCR17 live/app check, while PCR16 is for setup-time provisioning and key forwarding. Verifiers also check the AWS certificate chain, COSE signature, attestation freshness, expected nonce policy, and manifest PCR0 through PCR3.
 Before provisioning a namespace with the Quorum Key, a Share Set will use the output of the attestation process against the enclave to verify that the enclave is running the expected version of QuorumOS and that that instance is configured in the expected manner as to warrant being provisioned with that Quorum Key.
 
 Continued reading for attesting with nitro enclaves:
