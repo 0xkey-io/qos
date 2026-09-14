@@ -23,6 +23,8 @@ class WorkflowBoundariesTest < Minitest::Test
     stagex = workflow("stagex.yml")
     assert_equal({ "contents" => "read" }, stagex.fetch("permissions"))
     assert_equal ["build", "build-artifacts"], stagex.fetch("jobs").keys
+    assert_equal "ubuntu-24.04", stagex.dig("jobs", "build", "runs-on")
+    assert_equal "ubuntu-24.04", stagex.dig("jobs", "build-artifacts", "runs-on")
     stagex.fetch("jobs").each_value do |job|
       refute job.key?("permissions")
       refute job.key?("secrets")

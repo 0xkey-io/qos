@@ -80,7 +80,8 @@ jobs:
           docker buildx version
           builder="qos-qemu-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           node="$builder"
-          docker buildx create --name "$builder" --node "$node" --driver docker-container --use qos-validation
+          docker buildx create --name "$builder" --node "$node" --driver docker-container \
+            --driver-opt default-load=true --use qos-validation
           printf 'BUILDX_BUILDER=%s\n' "$builder" >>"$GITHUB_ENV"
           export BUILDX_BUILDER="$builder"
           docker buildx inspect "$builder" --bootstrap

@@ -17,7 +17,7 @@ permissions:
 jobs:
   build:
     name: build ${{ matrix.name }}
-    runs-on: ubicloud-standard-16
+    runs-on: ubuntu-24.04
     strategy:
       # One job per image so builds/pushes run in parallel. Don't cancel the
       # other images if one fails.
@@ -51,7 +51,7 @@ jobs:
     name: build artifacts
     needs: build
     if: ${{ always() }}
-    runs-on: ubicloud-standard-2
+    runs-on: ubuntu-24.04
     steps:
       - name: Verify all image builds succeeded
         run: |

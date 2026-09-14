@@ -59,6 +59,7 @@ class QemuLocalWorkflowTest < Minitest::Test
     runs = @steps.map { |step| step["run"] }.compact.join("\n")
     assert_includes runs, ".github/scripts/verify-buildx-container.sh"
     assert_includes runs, 'builder="qos-qemu-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"'
+    assert_includes runs, "--driver-opt default-load=true"
   end
 
   def test_gate_uses_local_images_exact_tests_and_always_cleanup
