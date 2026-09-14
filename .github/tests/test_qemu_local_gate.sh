@@ -266,10 +266,26 @@ test_success_builds_exact_targets_and_requires_two_passes() {
     QOS_TEST_QEMU_CLIENT_IMAGE='qos-local/qos_client:latest'
     QOS_TEST_QEMU_PIVOT_IMAGE='qos-local/signed_echo:latest'
     FAKE_LIST_OUTPUT=$'signed_echo_egress_get_url: test\nsigned_echo_ingress: test'
-    FAKE_RUN_OUTPUT=$'test signed_echo_egress_get_url ... ok\ntest signed_echo_ingress ... ok')
+    FAKE_RUN_OUTPUT='test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 146.28s')
   output="$(gate_env "$tmp" "${common_env[@]}" "$entry" run-tests)"
   [[ "$output" == *'listed_tests=2'* && "$output" == *'passed_tests=2'* && "$output" == *'gate_exit=0'* ]] || fail 'two-test success evidence was incomplete'
   grep -Fq 'cargo test --locked -p qos_test_harness --features qemu-ci --test docker_host_qemu_nitro -- --nocapture --test-threads=1' "$tmp/calls" || fail 'QEMU test command changed'
+}
+
+test_non_exact_cargo_summary_is_rejected() {
+  local tmp common_env
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  make_fixture "$tmp"
+  common_env=(env QOS_TEST_QEMU_ENCLAVE_IMAGE='qos-local/qos_enclave_egress:latest'
+    QOS_TEST_QEMU_HOST_IMAGE='qos-local/qos_host_qemu:latest'
+    QOS_TEST_QEMU_BRIDGE_IMAGE='qos-local/qos_bridge_qemu:latest'
+    QOS_TEST_QEMU_CLIENT_IMAGE='qos-local/qos_client:latest'
+    QOS_TEST_QEMU_PIVOT_IMAGE='qos-local/signed_echo:latest'
+    FAKE_LIST_OUTPUT=$'signed_echo_egress_get_url: test\nsigned_echo_ingress: test'
+    FAKE_RUN_OUTPUT='test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out')
+  assert_fails 'expected exactly two passing QEMU tests' gate_env "$tmp" \
+    "${common_env[@]}" "$entry" run-tests
 }
 
 test_cleanup_removes_only_harness_prefixed_resources() {

@@ -259,8 +259,16 @@ run_tests() {
   tee_exit="${statuses[1]}"
   [[ "$cargo_exit" -eq 0 ]] || die "QEMU test command failed with exit ${cargo_exit}"
   [[ "$tee_exit" -eq 0 ]] || die "evidence capture failed with exit ${tee_exit}"
-  passed="$(awk '$1 == "test" && $NF == "ok" { print $2 }' "$run_log" | sort)"
-  [[ "$passed" == "$expected_tests" ]] || \
+  # With --nocapture, test output may be emitted between Cargo's test-name
+  # prefix and its trailing `ok`.  The discovery result already pins the exact
+  # two names, so validate Cargo's final aggregate after removing ANSI color.
+  passed="$(sed $'s/\033\\[[0-9;]*m//g' "$run_log" | awk '
+    /^test result: ok\. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;/ {
+      count += 1
+    }
+    END { print count + 0 }
+  ')"
+  [[ "$passed" -eq 1 ]] || \
     die 'expected exactly two passing QEMU tests'
   printf 'listed_tests=2\npassed_tests=2\ngate_exit=0\n'
   phase_success
