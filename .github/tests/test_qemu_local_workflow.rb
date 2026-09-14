@@ -15,12 +15,14 @@ class QemuLocalWorkflowTest < Minitest::Test
     @steps = @job.fetch("steps")
   end
 
-  def test_gate_is_manual_read_only_and_single_job
-    assert_equal ["workflow_dispatch"], @document.fetch("on").keys
+  def test_gate_runs_for_pull_requests_and_manual_exact_sources
+    assert_equal ["pull_request", "workflow_dispatch"], @document.fetch("on").keys
     source_input = @document.dig("on", "workflow_dispatch", "inputs", "source_sha")
     assert_equal true, source_input.fetch("required")
     assert_equal "string", source_input.fetch("type")
     assert_equal({ "contents" => "read" }, @document.fetch("permissions"))
+    assert_equal "${{ github.event_name == 'pull_request' && github.sha || inputs.source_sha }}",
+                 @document.dig("env", "SOURCE_SHA")
     assert_equal ["qemu-gate"], @document.fetch("jobs").keys
     assert_equal "ubuntu-24.04", @job.fetch("runs-on")
     assert_equal 90, @job.fetch("timeout-minutes")

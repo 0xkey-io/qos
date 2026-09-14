@@ -19,11 +19,21 @@ def checkout_steps(document)
 end
 
 class WorkflowBoundariesTest < Minitest::Test
-  def test_upstream_publication_jobs_are_not_reachable_on_fork
+  def test_fork_ci_is_read_only_and_has_no_publication_path
     stagex = workflow("stagex.yml")
-    assert_equal "github.repository_owner == 'tkhq'", stagex.dig("jobs", "build", "if")
-    assert_equal "github.repository_owner == 'tkhq' && always()", stagex.dig("jobs", "build-artifacts", "if")
-    assert_equal "github.repository_owner == 'tkhq' && github.event_name == 'pull_request'", stagex.dig("jobs", "qemu-e2e", "if")
+    assert_equal({ "contents" => "read" }, stagex.fetch("permissions"))
+    assert_equal ["build", "build-artifacts"], stagex.fetch("jobs").keys
+    stagex.fetch("jobs").each_value do |job|
+      refute job.key?("permissions")
+      refute job.key?("secrets")
+      refute job.key?("environment")
+    end
+
+    executable = stagex.fetch("jobs").values.flat_map { |job| job.fetch("steps", []) }.to_s.downcase
+    %w[aws oidc ghcr ecr login push publish deploy id-token packages].each do |term|
+      refute_includes executable, term
+    end
+
     assert_equal "github.repository_owner == 'tkhq'", workflow("signed-echo-image.yml").dig("jobs", "publish", "if")
     assert_equal "github.repository_owner == 'tkhq'", workflow("stagex-release.yml").dig("jobs", "build", "if")
   end

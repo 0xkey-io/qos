@@ -1,6 +1,7 @@
 name: Exact-source local QEMU validation
 
 on:
+  pull_request:
   workflow_dispatch:
     inputs:
       source_sha:
@@ -12,7 +13,7 @@ permissions:
   contents: read
 
 env:
-  SOURCE_SHA: ${{ inputs.source_sha }}
+  SOURCE_SHA: ${{ github.event_name == 'pull_request' && github.sha || inputs.source_sha }}
   CONTROLLER_DIR: ${{ github.workspace }}/controller
   SOURCE_DIR: ${{ github.workspace }}/source
 
