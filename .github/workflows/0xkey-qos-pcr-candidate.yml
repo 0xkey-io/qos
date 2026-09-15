@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
-      SOURCE_SHA: e5fd9547df1df7c5064f01a0b46bcb34a1da84ce
+      SOURCE_SHA: aae88a248914aa061f982a0a3618f67157c159dd
       WORKFLOW_SHA: ${{ github.sha }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -32,7 +32,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: e5fd9547df1df7c5064f01a0b46bcb34a1da84ce
+          ref: aae88a248914aa061f982a0a3618f67157c159dd
           path: source
           persist-credentials: false
       - uses: ./tooling/.github/actions/docker-setup
@@ -53,7 +53,7 @@ jobs:
           (cd bundle && sha256sum -c SHA256SUMS)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: qos-pcr-e5fd9547-${{ github.run_id }}
+          name: qos-pcr-aae88a24-${{ github.run_id }}
           path: bundle/*
           if-no-files-found: error
           retention-days: 14
