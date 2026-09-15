@@ -1,0 +1,59 @@
+name: QoS PCR candidate
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/0xkey-qos-pcr-candidate.yml'
+      - '.github/scripts/qos-pcr-bundle.rb'
+      - '.github/tests/test_qos_pcr_bundle.rb'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - run: ruby .github/tests/test_qos_pcr_bundle.rb
+  build:
+    needs: test
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      SOURCE_SHA: e5fd9547df1df7c5064f01a0b46bcb34a1da84ce
+      WORKFLOW_SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: tooling
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: e5fd9547df1df7c5064f01a0b46bcb34a1da84ce
+          path: source
+          persist-credentials: false
+      - uses: ./tooling/.github/actions/docker-setup
+      - name: Build fixed source and collect PCR candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git -C tooling rev-parse HEAD)" = "$WORKFLOW_SHA"
+          make -C source out/qos_enclave/index.json
+          mkdir bundle
+          (cd source/out/qos_enclave && tar -cf - . | docker load)
+          cid=$(docker create qos-local/qos_enclave:latest)
+          trap 'docker rm "$cid" >/dev/null' EXIT
+          docker cp "$cid:/nitro.eif" bundle/nitro.eif
+          docker cp "$cid:/nitro.pcrs" bundle/nitro.pcrs
+          test -z "$(git -C source status --porcelain --untracked-files=no)"
+          ruby tooling/.github/scripts/qos-pcr-bundle.rb bundle
+          (cd bundle && sha256sum -c SHA256SUMS)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: qos-pcr-e5fd9547-${{ github.run_id }}
+          path: bundle/*
+          if-no-files-found: error
+          retention-days: 14
