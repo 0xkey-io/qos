@@ -1,0 +1,264 @@
+name: qos_client 操作端发布
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/0xkey-qos-client-release.yml'
+      - '.github/scripts/qos-client-*.rb'
+      - '.github/tests/test_qos_client_*.rb'
+      - '.github/actions/docker-setup/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'rust-toolchain.toml'
+      - 'Makefile'
+      - 'src/**'
+  push:
+    tags: ['0xkey-qos_client-v*']
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: '已存在的稳定版本标签，例如 0xkey-qos_client-v0.2.0'
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: qos-client-${{ inputs.release_tag || github.ref }}
+  cancel-in-progress: false
+defaults:
+  run:
+    shell: bash
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      source_sha: ${{ steps.source.outputs.source_sha }}
+      source_tree: ${{ steps.source.outputs.source_tree }}
+      release_tag: ${{ steps.source.outputs.release_tag }}
+      publish: ${{ steps.source.outputs.publish }}
+    steps:
+      - name: 校验事件后选择 checkout
+        id: select
+        env:
+          INPUT_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          case "$GITHUB_EVENT_NAME" in
+            pull_request)
+              [[ "$GITHUB_REF" =~ ^refs/pull/[1-9][0-9]*/merge$ ]]
+              selected="$GITHUB_SHA"
+              ;;
+            push)
+              [[ "$GITHUB_REF" =~ ^refs/tags/0xkey-qos_client-v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+              selected="$GITHUB_REF"
+              ;;
+            workflow_dispatch)
+              [[ "$GITHUB_REF" == refs/heads/main ]]
+              [[ "$INPUT_TAG" =~ ^0xkey-qos_client-v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+              selected="refs/tags/$INPUT_TAG"
+              ;;
+            *) exit 1 ;;
+          esac
+          printf 'ref=%s\n' "$selected" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ steps.select.outputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: 验证来源与 main 历史
+        id: source
+        env:
+          INPUT_TAG: ${{ inputs.release_tag }}
+        run: ruby .github/scripts/qos-client-source.rb
+  linux:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+      SOURCE_TREE: ${{ needs.prepare.outputs.source_tree }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: 核对来源
+        env:
+          INPUT_TAG: ${{ inputs.release_tag }}
+          EXPECTED_SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          EXPECTED_SOURCE_TREE: ${{ needs.prepare.outputs.source_tree }}
+        run: ruby .github/scripts/qos-client-source.rb
+      - uses: ./.github/actions/docker-setup
+      - name: 构建 StageX 客户端
+        run: make out/qos_client/index.json
+      - name: 提取并校验 Linux 客户端
+        run: |
+          set -euo pipefail
+          mkdir bundle
+          (cd out/qos_client && tar -cf - . | docker load)
+          cid=$(docker create qos-local/qos_client:latest)
+          trap 'docker rm "$cid" >/dev/null' EXIT
+          docker cp "$cid:/qos_client" bundle/qos_client.linux-amd64
+          chmod +x bundle/qos_client.linux-amd64
+          ruby .github/scripts/qos-client-artifacts.rb record linux-amd64 bundle
+      - name: 构建后核对来源
+        env:
+          INPUT_TAG: ${{ inputs.release_tag }}
+          EXPECTED_SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          EXPECTED_SOURCE_TREE: ${{ needs.prepare.outputs.source_tree }}
+        run: ruby .github/scripts/qos-client-source.rb
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: qos_client-linux-amd64
+          path: bundle/*
+          if-no-files-found: error
+          retention-days: 7
+  darwin:
+    needs: prepare
+    runs-on: macos-14
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+      SOURCE_TREE: ${{ needs.prepare.outputs.source_tree }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+      SOURCE_DATE_EPOCH: '1'
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+      CARGO_TERM_COLOR: never
+      CARGO_PROFILE_RELEASE_STRIP: symbols
+      RUSTUP_TOOLCHAIN: '1.94'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: 核对来源
+        env:
+          INPUT_TAG: ${{ inputs.release_tag }}
+          EXPECTED_SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          EXPECTED_SOURCE_TREE: ${{ needs.prepare.outputs.source_tree }}
+        run: ruby .github/scripts/qos-client-source.rb
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: '1.94'
+          targets: aarch64-apple-darwin
+      - name: 构建并校验 Darwin 客户端
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --features smartcard --target aarch64-apple-darwin -p qos_client
+          mkdir bundle
+          cp target/aarch64-apple-darwin/release/qos_client bundle/qos_client.darwin-arm64
+          chmod +x bundle/qos_client.darwin-arm64
+          RUSTC_VERSION="$(rustc --version)"
+          export RUSTC_VERSION
+          ruby .github/scripts/qos-client-artifacts.rb record darwin-arm64 bundle
+      - name: 构建后核对来源
+        env:
+          INPUT_TAG: ${{ inputs.release_tag }}
+          EXPECTED_SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          EXPECTED_SOURCE_TREE: ${{ needs.prepare.outputs.source_tree }}
+        run: ruby .github/scripts/qos-client-source.rb
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: qos_client-darwin-arm64
+          path: bundle/*
+          if-no-files-found: error
+          retention-days: 7
+  verify:
+    needs: [prepare, linux, darwin]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+      SOURCE_TREE: ${{ needs.prepare.outputs.source_tree }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: 核对来源
+        env:
+          INPUT_TAG: ${{ inputs.release_tag }}
+          EXPECTED_SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          EXPECTED_SOURCE_TREE: ${{ needs.prepare.outputs.source_tree }}
+        run: ruby .github/scripts/qos-client-source.rb
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: qos_client-linux-amd64
+          path: artifacts/qos_client-linux-amd64
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: qos_client-darwin-arm64
+          path: artifacts/qos_client-darwin-arm64
+      - name: 校验双平台 bundle
+        run: |
+          ruby .github/scripts/qos-client-artifacts.rb assemble artifacts release
+          printf '双平台制品验证通过；来源 %s / %s\n' "$SOURCE_SHA" "$SOURCE_TREE" >> "$GITHUB_STEP_SUMMARY"
+  publish:
+    if: ${{ needs.prepare.outputs.publish == 'true' }}
+    needs: [prepare, verify]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+    env:
+      SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+      SOURCE_TREE: ${{ needs.prepare.outputs.source_tree }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: 核对来源
+        env:
+          INPUT_TAG: ${{ inputs.release_tag }}
+          EXPECTED_SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          EXPECTED_SOURCE_TREE: ${{ needs.prepare.outputs.source_tree }}
+        run: ruby .github/scripts/qos-client-source.rb
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: qos_client-linux-amd64
+          path: artifacts/qos_client-linux-amd64
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: qos_client-darwin-arm64
+          path: artifacts/qos_client-darwin-arm64
+      - name: 重新校验制品
+        run: ruby .github/scripts/qos-client-artifacts.rb assemble artifacts release
+      - name: 拒绝已存在的 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[].tag_name' > "$RUNNER_TEMP/release-tags"
+          if grep -Fxq "$RELEASE_TAG" "$RUNNER_TEMP/release-tags"; then
+            echo 'Release 已存在，拒绝覆盖' >&2
+            exit 1
+          fi
+      - name: 生成构建证明
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45
+        with:
+          subject-path: |
+            release/qos_client.linux-amd64
+            release/qos_client.linux-amd64.sha256
+            release/qos_client.darwin-arm64
+            release/qos_client.darwin-arm64.sha256
+            release/MANIFEST.json
+      - name: 创建不可变发布
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          url=$(gh release create "$RELEASE_TAG" --verify-tag --target "$SOURCE_SHA" \
+            --title "qos_client $RELEASE_TAG" --notes "双平台操作端客户端。来源与构建事实见 MANIFEST.json。" \
+            release/qos_client.linux-amd64 release/qos_client.linux-amd64.sha256 \
+            release/qos_client.darwin-arm64 release/qos_client.darwin-arm64.sha256 release/MANIFEST.json)
+          printf 'Release: %s\n验证：gh attestation verify <文件> -R %s\n' "$url" "$GITHUB_REPOSITORY" >> "$GITHUB_STEP_SUMMARY"

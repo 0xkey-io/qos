@@ -74,6 +74,9 @@ jobs:
           [[ "$cargo_version" == 'cargo 1.94.0 '* ]]
       - name: Run local workflow and helper tests
         run: |
+          ruby .github/tests/test_qos_client_source.rb
+          ruby .github/tests/test_qos_client_artifacts.rb
+          ruby .github/tests/test_qos_client_release_workflow.rb
           bash .github/tests/test_exact_source_fd_gate.sh
           bash .github/tests/test_qemu_local_gate.sh
           bash .github/tests/test_pr_source_gate.sh

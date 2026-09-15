@@ -43,6 +43,8 @@
 
 发布模式下，来源 commit 必须可从 `origin/main` 到达。工作流记录 commit 与 tree 两种身份。各构建 job 独立检查 checkout 是否与准备阶段确定的身份一致。发布 job 在消费制品前再次执行身份检查。
 
+复审补充：`workflow_dispatch` 必须从 `refs/heads/main` 执行；标签通过环境变量传递并使用锚定正则校验，Git 子命令使用参数数组。构建结束、上传制品之前再次核对来源身份及 tracked 文件是否保持干净。
+
 ## 权限边界
 
 工作流级权限为 `contents: read`。准备、Linux、Darwin 与 PR 汇总 job 均保持只读。只有仅发布模式可执行的发布 job 获得：
