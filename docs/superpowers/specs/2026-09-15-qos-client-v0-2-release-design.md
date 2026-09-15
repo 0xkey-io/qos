@@ -62,7 +62,7 @@
 Linux job 在 `ubuntu-24.04` 上运行，只通过已审阅的 StageX/Buildx 路径构建 `out/qos_client/index.json`。它加载该 OCI layout、提取 `/qos_client`，并验证：
 
 - 文件可执行，且被识别为 x86-64 Linux 可执行文件；
-- 二进制以 `--help` 调用时成功返回；
+- 二进制以 `host-health --help` 调用时成功返回（QoS CLI 要求先指定子命令，不支持顶层 `--help`）；
 - `provision-yubikey`、`approve-manifest`、`proxy-re-encrypt-share` 与 `after-genesis` 的 help 调用均成功；
 - SHA-256 写为 `<64 位小写十六进制><两个空格>qos_client.linux-amd64`。
 

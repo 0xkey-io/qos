@@ -27,7 +27,7 @@ class QosClientArtifactsTest < Minitest::Test
                    "runtime" => platform == "linux-amd64" ? "ubuntu-24.04" : "macos-14",
                    "rustc" => platform == "linux-amd64" ? "stagex-pinned" : "rustc 1.94.0 (fixture)",
                    "deployment_target" => platform == "linux-amd64" ? "" : "11.0",
-                   "help_checks" => ["--help", "provision-yubikey", "approve-manifest", "proxy-re-encrypt-share", "after-genesis"] }
+                   "help_checks" => ["host-health", "provision-yubikey", "approve-manifest", "proxy-re-encrypt-share", "after-genesis"] }
       File.write(File.join(path, "metadata.json"), JSON.generate(metadata))
     end
   end
@@ -78,5 +78,38 @@ class QosClientArtifactsTest < Minitest::Test
   def test_existing_destination
     Dir.mkdir(File.join(@dir, "release"))
     run_bundle(success: false)
+  end
+
+  def test_record_real_executable_requires_each_subcommand_help
+    platform = RUBY_PLATFORM.include?("darwin") ? "darwin-arm64" : "linux-amd64"
+    bundle = File.join(@dir, "record")
+    Dir.mkdir(bundle)
+    binary = File.join(bundle, "qos_client.#{platform}")
+    source = <<~C
+      #include <string.h>
+      #include <stdlib.h>
+      int main(int argc, char **argv) {
+        const char *commands[] = {"host-health", "provision-yubikey", "approve-manifest", "proxy-re-encrypt-share", "after-genesis"};
+        if (argc != 3 || strcmp(argv[2], "--help")) return 1;
+        const char *fail = getenv("FAIL_HELP");
+        if (fail && !strcmp(fail, argv[1])) return 7;
+        for (int i = 0; i < 5; i++) if (!strcmp(commands[i], argv[1])) return 0;
+        return 1;
+      }
+    C
+    _out, err, compiled = Open3.capture3("cc", "-x", "c", "-", "-o", binary, stdin_data: source)
+    assert compiled.success?, err
+    env = @env.merge("RUSTC_VERSION" => "rustc 1.94.0 (fixture)")
+    commands = %w[host-health provision-yubikey approve-manifest proxy-re-encrypt-share after-genesis]
+    commands.each do |command|
+      _out, err, result = Open3.capture3(env.merge("FAIL_HELP" => command), "ruby", SCRIPT, "record", platform, bundle)
+      refute result.success?
+      assert_includes err, "required help check failed: #{command}, exit=7"
+      refute File.exist?(File.join(bundle, "metadata.json"))
+    end
+    _out, err, result = Open3.capture3(env, "ruby", SCRIPT, "record", platform, bundle)
+    assert result.success?, err
+    metadata = JSON.parse(File.read(File.join(bundle, "metadata.json")))
+    assert_equal commands, metadata.fetch("help_checks")
   end
 end

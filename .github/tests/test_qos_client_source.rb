@@ -52,13 +52,13 @@ class QosClientSourceTest < Minitest::Test
   def test_pr_uses_merge_commit_without_main_ancestry_requirement
     git("commit", "--allow-empty", "-m", "candidate")
     sha = git("rev-parse", "HEAD").strip
-    result = check("GITHUB_EVENT_NAME" => "pull_request", "GITHUB_REF" => "refs/pull/42/merge", "GITHUB_SHA" => sha)
+    result = check({ "GITHUB_EVENT_NAME" => "pull_request", "GITHUB_REF" => "refs/pull/42/merge", "GITHUB_SHA" => sha })
     assert_includes result, "publish=false\n"
     assert_includes result, "release_tag=\n"
   end
 
   def test_dispatch_from_main
-    check("GITHUB_EVENT_NAME" => "workflow_dispatch", "GITHUB_REF" => "refs/heads/main", "INPUT_TAG" => TAG)
+    check({ "GITHUB_EVENT_NAME" => "workflow_dispatch", "GITHUB_REF" => "refs/heads/main", "INPUT_TAG" => TAG })
   end
 
   def test_dispatch_from_other_branch_is_rejected

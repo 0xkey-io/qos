@@ -18,3 +18,9 @@
 Shell 测试方案采用 Ruby Open3 驱动真实 Git/CLI 子进程实现，与仓库既有 Ruby 契约测试保持一致。平台构建命令仍使用 Bash。
 
 本轮只建立发布工作流候选。后续发布需固定合并后的 QoS commit/tree，并协调 Enclave pin 与 Builder 输入，才能使用同一修订形成发布证据。
+
+## 首轮 CI 修复
+
+Linux 与 Darwin 实际编译均成功，但 QoS CLI 不支持顶层 `--help`，因此启动检查改为 `host-health --help`，四项 YubiKey 子命令检查保留。新增本机 C 可执行文件 fixture：五条命令分别失败时都拒绝生成元数据，完整命令集成功后才放行。
+
+Ubuntu Ruby 的参数解析拒绝两处无显式花括号的 Hash 实参，已改为明确的位置参数。本地 Ruby 4.0.1 全套 43 项测试、620 条断言通过；系统 Ruby 的聚焦制品测试也通过。Ubuntu Ruby 与两个真实平台命令面的最终结果等待远端复跑。

@@ -6,7 +6,7 @@ require "open3"
 require "time"
 
 PLATFORMS = %w[linux-amd64 darwin-arm64].freeze
-HELP = %w[--help provision-yubikey approve-manifest proxy-re-encrypt-share after-genesis].freeze
+HELP = %w[host-health provision-yubikey approve-manifest proxy-re-encrypt-share after-genesis].freeze
 FIELDS = %w[platform filename checksum_filename source_commit source_tree size sha256 build_method runtime rustc deployment_target help_checks].freeze
 
 def ensure_directory(path)
@@ -39,9 +39,9 @@ begin
     pattern = platform == "linux-amd64" ? /ELF 64-bit.*x86-64/ : /Mach-O 64-bit executable arm64/
     raise "binary architecture mismatch" unless status.success? && description.match?(pattern)
     HELP.each do |subcommand|
-      args = subcommand == "--help" ? ["--help"] : [subcommand, "--help"]
+      args = [subcommand, "--help"]
       _out, _err, result = Open3.capture3(binary, *args)
-      raise "required help check failed" unless result.success?
+      raise "required help check failed: #{subcommand}, exit=#{result.exitstatus}" unless result.success?
     end
     digest = Digest::SHA256.file(binary).hexdigest
     method, runtime, target = facts(platform)
