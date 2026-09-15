@@ -3,8 +3,8 @@ on:
   pull_request:
     paths:
       - '.github/workflows/0xkey-qos-pcr-candidate.yml'
-      - '.github/scripts/qos-pcr-bundle.rb'
-      - '.github/tests/test_qos_pcr_bundle.rb'
+      - '.github/scripts/qos-pcr-*.rb'
+      - '.github/tests/test_qos_pcr_*.rb'
   workflow_dispatch:
 permissions:
   contents: read
@@ -16,6 +16,7 @@ jobs:
         with:
           persist-credentials: false
       - run: ruby .github/tests/test_qos_pcr_bundle.rb
+      - run: ruby .github/tests/test_qos_pcr_source.rb
   build:
     needs: test
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
@@ -39,8 +40,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
-          test "$(git -C tooling rev-parse HEAD)" = "$WORKFLOW_SHA"
+          ruby tooling/.github/scripts/qos-pcr-source.rb "$PWD"
           make -C source out/qos_enclave/index.json
           mkdir bundle
           (cd source/out/qos_enclave && tar -cf - . | docker load)
@@ -48,7 +48,7 @@ jobs:
           trap 'docker rm "$cid" >/dev/null' EXIT
           docker cp "$cid:/nitro.eif" bundle/nitro.eif
           docker cp "$cid:/nitro.pcrs" bundle/nitro.pcrs
-          test -z "$(git -C source status --porcelain --untracked-files=no)"
+          ruby tooling/.github/scripts/qos-pcr-source.rb "$PWD"
           ruby tooling/.github/scripts/qos-pcr-bundle.rb bundle
           (cd bundle && sha256sum -c SHA256SUMS)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
